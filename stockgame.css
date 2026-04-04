@@ -2443,37 +2443,6 @@ tbody tr:hover {
   }
 }
 
-/* 初期表示で見える紹介（検索向けテキスト・ユーザー向け要約） */
-.seo-lead {
-  margin-bottom: 0;
-}
-
-.seo-lead__title {
-  margin: 0 0 10px;
-  font-size: 1.05rem;
-  color: #0b2325;
-}
-
-.seo-lead__p {
-  margin: 0 0 10px;
-  font-size: 0.92rem;
-  line-height: 1.65;
-  color: var(--text);
-  overflow-wrap: break-word;
-}
-
-.seo-lead__list {
-  margin: 0;
-  padding-left: 1.2rem;
-  font-size: 0.88rem;
-  line-height: 1.55;
-  color: #2d4546;
-}
-
-.seo-lead__list li {
-  margin: 0.4rem 0;
-}
-
 /* SEO / アクセシビリティ: 本文補足・noscript */
 .noscript-banner {
   margin: 0;

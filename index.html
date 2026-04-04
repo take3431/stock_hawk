@@ -117,7 +117,7 @@
     href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap"
     rel="stylesheet"
   />
-  <link rel="stylesheet" href="./stockgame.css?v=62" />
+  <link rel="stylesheet" href="./stockgame.css?v=63" />
 </head>
 <body>
   <noscript>
@@ -131,18 +131,6 @@
   <div class="bg-shape bg-shape-b"></div>
 
   <main class="app-shell">
-    <section class="card reveal seo-lead" aria-label="株のタカの紹介">
-      <h2 class="seo-lead__title">株のタカ（月次株価ランキング）について</h2>
-      <p class="seo-lead__p">
-        <strong>株のタカ</strong>は、毎月の<strong>株価上昇率</strong>で順位を競う<strong>無料の株ゲーム</strong>です。<strong>日本株</strong>・<strong>米国株</strong>・<strong>仮想通貨</strong>から銘柄を選び、<strong>月次ランキング</strong>と取引履歴を楽しめます。<strong>紙トレ</strong>やデモとしての<strong>株価シミュレーション</strong>にも向いています。
-      </p>
-      <ul class="seo-lead__list">
-        <li><strong>遊び方</strong>: アカウントを作成し、銘柄を追加して「銘柄を決定」でその月の参加を確定します。</li>
-        <li><strong>保有数</strong>: 1人あたり最低1銘柄・最大5銘柄です。</li>
-        <li><strong>注意</strong>: 表示は外部の株価データに依存します。特定銘柄の売買を推奨するものではありません。</li>
-      </ul>
-    </section>
-
     <header class="topbar card reveal">
       <div class="topbar-left">
         <h1>株のタカ<span class="title-hawk" aria-label="鷹">🦅</span></h1>
@@ -597,8 +585,11 @@
   <script src="./firebase-config.js?v=1"></script>
   <script>
     /*
-     * Supabase（株のタカクラウド）: publishable はブラウザに載せてよい公開キー。service_role（秘密キー）は絶対に書かないこと。
-     * Firebase 同期（STOCKGAME_FIREBASE_SYNC）と同時に enabled にしないこと。
+     * Supabase（株のタカクラウド）: service_role（秘密キー）は絶対に書かないこと。Firebase 同期と同時に enabled にしないこと。
+     *
+     * F12 で register/login が 401 のとき:
+     * 1) Dashboard → Edge Functions → 各関数で「JWT 検証」をオフ、または supabase/config.toml の verify_jwt=false をデプロイに含めて再デプロイ。
+     * 2) または API の「anon」「公開」JWT（eyJ で始まる長い文字列）を publishableKey に設定（ゲートウェイが JWT のみ受け付ける場合がある）。
      */
     window.STOCKGAME_SUPABASE_CLOUD = window.STOCKGAME_SUPABASE_CLOUD || {
       enabled: true,
@@ -607,6 +598,6 @@
     };
   </script>
   <script src="./jp_company_autocomplete_engine.js"></script>
-  <script src="./stockgame.js?v=73" defer></script>
+  <script src="./stockgame.js?v=74" defer></script>
 </body>
 </html>

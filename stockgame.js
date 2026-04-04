@@ -1014,14 +1014,17 @@ function getSupabaseCloudConfig() {
   if (!c || !c.enabled) return null;
   const base = String(c.functionsBaseUrl || "").trim().replace(/\/$/, "");
   if (!base) return null;
-  const publishableKey = String(c.publishableKey || c.anonKey || "").trim();
-  if (!publishableKey && !_warnedMissingSupabasePublishableKey) {
+  const anon = String(c.anonKey || "").trim();
+  const pub = String(c.publishableKey || "").trim();
+  /** ゲートウェイが JWT のみ受け付ける場合があるため、eyJ… の anon（旧公開キー）を優先 */
+  const invokeKey = anon || pub;
+  if (!invokeKey && !_warnedMissingSupabasePublishableKey) {
     _warnedMissingSupabasePublishableKey = true;
     console.warn(
-      "STOCKGAME_SUPABASE_CLOUD: publishableKey（または旧 anonKey）が未設定です。Supabase のゲートウェイが Edge を拒否する場合があります。"
+      "STOCKGAME_SUPABASE_CLOUD: publishableKey または anonKey が未設定です。Supabase のゲートウェイが Edge を拒否する場合があります。"
     );
   }
-  return { functionsBaseUrl: base, publishableKey: publishableKey || null };
+  return { functionsBaseUrl: base, publishableKey: invokeKey || null };
 }
 
 /**
@@ -1483,9 +1486,30 @@ function startCloudSyncPullLoop() {
   }, 45000);
 }
 
+function showBootInitError(err) {
+  console.error("stockgame init failed", err);
+  const msg = err && err.message ? String(err.message) : String(err);
+  const detail =
+    "ページの初期化に失敗しました。GitHub Pages では stockgame.js や jp_company_autocomplete_engine.js の 404、HTML の欠落がよくあります。F12 → コンソール・ネットワークを確認してください。\n\n" +
+    msg;
+  const box = document.getElementById("globalNotice");
+  if (box) {
+    box.classList.remove("hidden");
+    box.style.borderLeftColor = "#b4223a";
+    box.textContent = detail;
+  } else {
+    alert(detail);
+  }
+}
+
 document.addEventListener("DOMContentLoaded", () => {
-  registerSaveStateLifecycleHooks();
-  void initializeApp();
+  try {
+    registerSaveStateLifecycleHooks();
+  } catch (e) {
+    showBootInitError(e);
+    return;
+  }
+  void initializeApp().catch((e) => showBootInitError(e));
 });
 
 /** 会社マスタ待ちの前に同期。再読込直後の「未ログイン」一瞬表示を防ぐ */

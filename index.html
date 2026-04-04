@@ -2,27 +2,147 @@
 <html lang="ja">
 <head>
   <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="referrer" content="strict-origin-when-cross-origin" />
+  <!-- 初期は相対。読み込み直後に現在の絶対URLへ（クローラーがJS実行する場合に有効） -->
+  <link rel="canonical" id="seo-canonical" href="stockgame.html" />
+  <meta property="og:url" id="seo-og-url" content="" />
+  <script>
+    (function () {
+      try {
+        var abs = String(location.href || "").split("#")[0];
+        if (!abs) return;
+        var c = document.getElementById("seo-canonical");
+        if (c) c.setAttribute("href", abs);
+        var og = document.getElementById("seo-og-url");
+        if (og) og.setAttribute("content", abs);
+      } catch (_) {}
+    })();
+  </script>
   <meta
     name="description"
-    content="株のタカは毎月の株価上昇率で競う株価バトル＆ランキング。日本株・米国株・仮想通貨の銘柄を選び、月次のリターンを比較できます。株ゲーム・シミュレーション・紙トレ（デモ）向け。"
+    content="株のタカは毎月の株価上昇率で順位を競う無料の株ゲーム。日本株・米国株・仮想通貨から最大5銘柄を選び月次ランキング。アカウント登録で端末間のデータ同期が可能。紙トレ・デモ向けのブラウザシミュレーション。"
   />
   <meta
     name="keywords"
-    content="株のタカ,株価バトル,月次ランキング,株ゲーム,紙トレ,株価シミュレーション,日本株,米国株,仮想通貨,銘柄,上昇率,鷹"
+    content="株のタカ,株価バトル,月次ランキング,株ゲーム,紙トレ,株価シミュレーション,日本株,米国株,仮想通貨,銘柄,上昇率,ブラウザゲーム"
   />
+  <meta name="robots" content="index, follow, max-image-preview:large, max-snippet:-1, max-video-preview:-1" />
   <meta name="application-name" content="株のタカ" />
-  <title>株のタカ</title>
+  <meta name="mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-title" content="株のタカ" />
+  <meta name="theme-color" content="#0f1419" />
+  <meta name="format-detection" content="telephone=no" />
+  <title>株のタカ｜月次株価ランキング・株ゲーム（日本株・米国株・仮想通貨）</title>
+  <meta property="og:type" content="website" />
+  <meta property="og:site_name" content="株のタカ" />
+  <meta property="og:locale" content="ja_JP" />
+  <meta
+    property="og:title"
+    content="株のタカ｜月次株価ランキング・株ゲーム（日本株・米国株・仮想通貨）"
+  />
+  <meta
+    property="og:description"
+    content="毎月の株価上昇率で順位を競う無料のブラウザゲーム。日本株・米国株・仮想通貨から銘柄を選び、月次ランキングとアカウント同期に対応。"
+  />
+  <meta name="twitter:card" content="summary" />
+  <meta name="twitter:title" content="株のタカ｜月次株価ランキング・株ゲーム" />
+  <meta
+    name="twitter:description"
+    content="毎月の株価上昇率で競う無料の株ゲーム。日本株・米国株・仮想通貨対応。"
+  />
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@graph": [
+      {
+        "@type": "WebSite",
+        "name": "株のタカ",
+        "inLanguage": "ja-JP",
+        "description": "毎月の株価上昇率で順位を競う無料のブラウザ株ゲーム。日本株・米国株・仮想通貨の銘柄選択と月次ランキング。アカウント登録で端末間同期に対応。"
+      },
+      {
+        "@type": "WebApplication",
+        "name": "株のタカ",
+        "description": "毎月の株価上昇率で競う株価バトルとランキング。ブラウザで遊べる株シミュレーション・紙トレ向け。",
+        "applicationCategory": "GameApplication",
+        "browserRequirements": "Requires JavaScript. モダンブラウザ推奨。",
+        "operatingSystem": "Any",
+        "inLanguage": "ja-JP",
+        "isAccessibleForFree": true,
+        "offers": {
+          "@type": "Offer",
+          "price": "0",
+          "priceCurrency": "JPY"
+        }
+      },
+      {
+        "@type": "FAQPage",
+        "mainEntity": [
+          {
+            "@type": "Question",
+            "name": "株のタカは無料ですか？",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "ブラウザ上で無料で遊べる株価シミュレーション・月次ランキングゲームです。投資の勧誘や助言ではありません。"
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "どの市場の銘柄を選べますか？",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "日本株・米国株・仮想通貨から、最大5銘柄まで保有して月次の株価上昇率で順位を競えます。最低1銘柄から参加できます。"
+            }
+          },
+          {
+            "@type": "Question",
+            "name": "約定はいつですか？",
+            "acceptedAnswer": {
+              "@type": "Answer",
+              "text": "日本株・米国株は1日2回（寄りの約30分後と終値）、仮想通貨は日本時間0:00と12:00を目安にゲーム内で約定します。"
+            }
+          }
+        ]
+      }
+    ]
+  }
+  </script>
+  <link rel="preconnect" href="https://wxnmhmlxxulbuyprxdpd.supabase.co" crossorigin />
+  <link rel="dns-prefetch" href="https://wxnmhmlxxulbuyprxdpd.supabase.co" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Montserrat:wght@500;700;800&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap" rel="stylesheet" />
-    <link rel="stylesheet" href="./stockgame.css?v=22" />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap"
+    rel="stylesheet"
+  />
+  <link rel="stylesheet" href="./stockgame.css?v=62" />
 </head>
 <body>
+  <noscript>
+    <div class="noscript-banner" role="alert">
+      <p>
+        <strong>株のタカ</strong>を利用するには JavaScript を有効にしてください。月次の株価上昇率で順位を競う無料の株ゲーム（日本株・米国株・仮想通貨）です。
+      </p>
+    </div>
+  </noscript>
   <div class="bg-shape bg-shape-a"></div>
   <div class="bg-shape bg-shape-b"></div>
 
   <main class="app-shell">
+    <section class="card reveal seo-lead" aria-label="株のタカの紹介">
+      <h2 class="seo-lead__title">株のタカ（月次株価ランキング）について</h2>
+      <p class="seo-lead__p">
+        <strong>株のタカ</strong>は、毎月の<strong>株価上昇率</strong>で順位を競う<strong>無料の株ゲーム</strong>です。<strong>日本株</strong>・<strong>米国株</strong>・<strong>仮想通貨</strong>から銘柄を選び、<strong>月次ランキング</strong>と取引履歴を楽しめます。<strong>紙トレ</strong>やデモとしての<strong>株価シミュレーション</strong>にも向いています。
+      </p>
+      <ul class="seo-lead__list">
+        <li><strong>遊び方</strong>: アカウントを作成し、銘柄を追加して「銘柄を決定」でその月の参加を確定します。</li>
+        <li><strong>保有数</strong>: 1人あたり最低1銘柄・最大5銘柄です。</li>
+        <li><strong>注意</strong>: 表示は外部の株価データに依存します。特定銘柄の売買を推奨するものではありません。</li>
+      </ul>
+    </section>
+
     <header class="topbar card reveal">
       <div class="topbar-left">
         <h1>株のタカ<span class="title-hawk" aria-label="鷹">🦅</span></h1>
@@ -44,6 +164,7 @@
         <button id="menuRegisterBtn" class="nav-btn" type="button">アカウント新規作成</button>
         <button id="menuPickBtn" class="nav-btn" type="button">銘柄を選ぶ</button>
         <button id="menuHistoryBtn" class="nav-btn hidden" type="button">これまでの結果</button>
+        <button id="menuCopySyncUrlBtn" class="nav-btn btn-ghost hidden" type="button" title="別ブラウザで同じデータを開くURL（Firebase設定時）">同期URLをコピー</button>
         <button id="topLogoutBtn" class="nav-btn nav-logout hidden" type="button">ログアウト</button>
       </nav>
     </header>
@@ -150,8 +271,8 @@
           <form id="authForm" autocomplete="on">
             <div class="field">
               <label for="authName">アカウント名（ID）</label>
-              <input id="authName" name="username" type="text" maxlength="16" placeholder="例: たろう / trader01" required />
-              <small>日本語可。2〜16文字、日本語/英数字/記号を使用できます。</small>
+              <input id="authName" name="username" type="text" maxlength="8" placeholder="例: たろう / trader01" required />
+              <small>日本語可。2〜8文字、日本語/英数字/記号を使用できます。</small>
             </div>
             <div class="field">
               <label for="authPassword">パスワード</label>
@@ -194,7 +315,7 @@
           </form>
           <form id="resetForm" class="stack-form hidden" autocomplete="on">
             <label for="resetName">アカウント名</label>
-            <input id="resetName" type="text" maxlength="16" placeholder="再設定するアカウント名" />
+            <input id="resetName" type="text" maxlength="8" placeholder="再設定するアカウント名" />
             <label for="resetRecoveryQuestion">再設定質問</label>
             <select id="resetRecoveryQuestion">
               <option value="BIRTH_CITY" selected>生まれ育った市区町村</option>
@@ -233,7 +354,7 @@
             <h3>取引履歴</h3>
             <p id="myTradeSummary" class="section-note">取引履歴はありません。</p>
             <div class="table-wrap">
-              <table>
+              <table id="myTradeTable">
                 <thead>
                   <tr>
                     <th>銘柄</th>
@@ -259,7 +380,7 @@
           <div id="renameFormBlock" class="account-form-block hidden">
             <form id="renameForm" class="stack-form">
               <label for="renameInput">アカウント名（ID）変更</label>
-              <input id="renameInput" type="text" maxlength="16" placeholder="新しいアカウント名" />
+              <input id="renameInput" type="text" maxlength="8" placeholder="新しいアカウント名" />
               <button type="submit" class="btn btn-ghost">名前を更新</button>
             </form>
           </div>
@@ -293,10 +414,11 @@
         </article>
 
         <article class="card reveal hidden" id="pickPanel">
-          <h2>銘柄エントリー</h2>
-          <p class="section-note">
-            約定は日本株・米国株が「市場開始30分後」と「終値」、仮想通貨が0:00と12:00（JST）。1銘柄以上で集計されます。
-          </p>
+          <h2>銘柄選択</h2>
+          <div class="pick-timing-note" role="note">
+            <span class="pick-timing-note__hdr">約定</span>
+            <span class="pick-timing-note__txt">日本・米国株は「寄りの約30分後」と「終値」。仮想通貨は日本時間の0:00と12:00</span>
+          </div>
           <form id="symbolForm" autocomplete="on">
             <div class="field-grid">
               <div class="field">
@@ -459,11 +581,32 @@
     </div>
   </main>
 
+  <footer class="site-footer" role="contentinfo" lang="ja">
+    <div class="site-footer-inner">
+      <p class="site-footer-lead">
+        <strong>株のタカ</strong>は、毎月の<strong>株価上昇率</strong>で順位を競う<strong>無料のブラウザゲーム</strong>です。<strong>日本株</strong>・<strong>米国株</strong>・<strong>仮想通貨</strong>から最大5銘柄を選び、<strong>月次ランキング</strong>や取引履歴の確認ができます。投資の勉強や<strong>紙トレ</strong>・デモ感覚の<strong>株価シミュレーション</strong>にお使いいただけます。
+      </p>
+      <p class="site-footer-note">表示される株価等は外部データを参照しており、特定の投資の勧誘や助言ではありません。</p>
+    </div>
+  </footer>
+
   <template id="hintChipTemplate">
     <button type="button" class="hint-chip"></button>
   </template>
 
+  <script src="./firebase-config.js?v=1"></script>
+  <script>
+    /*
+     * Supabase（株のタカクラウド）: publishable はブラウザに載せてよい公開キー。service_role（秘密キー）は絶対に書かないこと。
+     * Firebase 同期（STOCKGAME_FIREBASE_SYNC）と同時に enabled にしないこと。
+     */
+    window.STOCKGAME_SUPABASE_CLOUD = window.STOCKGAME_SUPABASE_CLOUD || {
+      enabled: true,
+      functionsBaseUrl: "https://wxnmhmlxxulbuyprxdpd.supabase.co/functions/v1",
+      publishableKey: "sb_publishable_3rmoppki9EU8DBzHlXjz2g_j1NWmf68"
+    };
+  </script>
   <script src="./jp_company_autocomplete_engine.js"></script>
-    <script src="./stockgame.js?v=42" defer></script>
+  <script src="./stockgame.js?v=73" defer></script>
 </body>
 </html>

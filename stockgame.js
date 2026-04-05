@@ -950,6 +950,12 @@ const app = {
   pendingRegistration: null,
   registerConfirmWindow: null,
   autoFixInFlight: false,
+  /** 予測リストから選んだ直後は、入力文字が変わるまで候補を出さない */
+  symbolSuggestFreezeUntilEdit: false,
+  symbolSuggestFreezeBaseline: "",
+  /** バックグラウンド setInterval / リスナーの二重登録防止 */
+  _backgroundTimersStarted: false,
+  _cloudSyncPullLoopRegistered: false,
   els: {}
 };
 
@@ -999,15 +1005,26 @@ function getFirebaseSyncConfig() {
 
 /**
  * Supabase Edge Functions 同期（認証・状態は Edge + サービスロール）。
- * window.STOCKGAME_SUPABASE_CLOUD = { enabled: true, functionsBaseUrl: "https://<ref>.supabase.co/functions/v1", publishableKey: "<Dashboard の Publishable key>" }
+ * window.STOCKGAME_SUPABASE_CLOUD = {
+ *   enabled: true,
+ *   functionsBaseUrl: "https://<ref>.supabase.co/functions/v1",
+ *   publishableKey: "sb_publishable_…"（任意・apikey ヘッダ向け）,
+ *   anonKey: "eyJ…"（JWT・ゲートウェイ検証が有効なときログイン前の Authorization に必須）
+ * }
  * Firebase 同期より優先される（同時に有効にしないこと）。
  *
  * デプロイ一覧:
- *   register, login, logout, reset-password, load-state, save-state, change-password, rename-account
- * CORS: credentials: omit。Edge は Allow-Origin: *。ゲートウェイ通過用に apikey ＋ Authorization（公式推奨の publishable / 旧 anon）。
+ *   register, login, logout, reset-password, load-state, save-state, change-password, rename-account, delete-account
+ * CORS: credentials: omit。Edge は Allow-Origin: *。
+ * sb_publishable_* は JWT ではないため、verify_jwt が有効なとき Authorization に渡すと 401（Missing authorization / Invalid JWT）になる。anonKey（eyJ…）を別途渡す。
  * サーバーで app_users 削除時は API が code: SESSION_INVALID（401）を返し、クライアントはトークン破棄＋リモートユーザーをローカルから除去する。
  */
 let _warnedMissingSupabasePublishableKey = false;
+let _warnedMissingSupabaseGatewayJwt = false;
+
+function isLikelySupabaseJwtKey(s) {
+  return typeof s === "string" && s.startsWith("eyJ") && s.includes(".");
+}
 
 function getSupabaseCloudConfig() {
   const c = typeof window !== "undefined" && window.STOCKGAME_SUPABASE_CLOUD;
@@ -1016,34 +1033,62 @@ function getSupabaseCloudConfig() {
   if (!base) return null;
   const anon = String(c.anonKey || "").trim();
   const pub = String(c.publishableKey || "").trim();
-  /** ゲートウェイが JWT のみ受け付ける場合があるため、eyJ… の anon（旧公開キー）を優先 */
-  const invokeKey = anon || pub;
-  if (!invokeKey && !_warnedMissingSupabasePublishableKey) {
+  const jwtAnon = isLikelySupabaseJwtKey(anon)
+    ? anon
+    : isLikelySupabaseJwtKey(pub)
+      ? pub
+      : "";
+  const apikeyHeader = pub || anon || jwtAnon || null;
+
+  if (!apikeyHeader && !_warnedMissingSupabasePublishableKey) {
     _warnedMissingSupabasePublishableKey = true;
     console.warn(
       "STOCKGAME_SUPABASE_CLOUD: publishableKey または anonKey が未設定です。Supabase のゲートウェイが Edge を拒否する場合があります。"
     );
   }
-  return { functionsBaseUrl: base, publishableKey: invokeKey || null };
+
+  const hasNonJwtOnly =
+    apikeyHeader &&
+    !jwtAnon &&
+    !isLikelySupabaseJwtKey(pub) &&
+    !isLikelySupabaseJwtKey(anon);
+  if (hasNonJwtOnly && !_warnedMissingSupabaseGatewayJwt) {
+    _warnedMissingSupabaseGatewayJwt = true;
+    console.warn(
+      "STOCKGAME_SUPABASE_CLOUD: sb_publishable のみでは Edge の JWT ゲートウェイで 401 になることがあります。Dashboard → Settings → API の anon（eyJ…）を anonKey に追加するか、各関数で JWT 検証をオフ（verify_jwt=false）にしてください。"
+    );
+  }
+
+  return {
+    functionsBaseUrl: base,
+    apikeyHeader,
+    /** ログイン前の Authorization: Bearer（ゲートウェイ用）。セッション取得後は STOCKGAME セッショントークンを使う */
+    gatewayJwt: jwtAnon || null,
+    fallbackBearer: apikeyHeader
+  };
 }
 
 /**
- * Supabase Edge 呼び出し用ヘッダー（apikey 必須に近い。未ログイン時は Authorization に publishable を渡すのが一般的）。
+ * Supabase Edge 呼び出し用ヘッダー（apikey ＋ Authorization）。
  * @param {Headers} headers
- * @param {{ functionsBaseUrl: string, publishableKey: string|null }} cfg
+ * @param {{ apikeyHeader: string|null, gatewayJwt: string|null, fallbackBearer: string|null }} cfg
  * @param {{ bearerToken?: string|null }} [opts] logout 等で明示的にトークンを渡す。省略時は getSupabaseSessionToken()
  */
 function setSupabaseEdgeFetchHeaders(headers, cfg, opts) {
-  const pk = cfg.publishableKey;
+  const apikey = cfg.apikeyHeader;
+  const gatewayJwt = cfg.gatewayJwt;
+  const fallbackBearer = cfg.fallbackBearer;
   let bearer = opts && Object.prototype.hasOwnProperty.call(opts, "bearerToken")
     ? opts.bearerToken
     : getSupabaseSessionToken();
   if (bearer === undefined) bearer = null;
-  if (pk) headers.set("apikey", pk);
+  if (apikey) headers.set("apikey", apikey);
   if (bearer) {
     headers.set("Authorization", `Bearer ${bearer}`);
-  } else if (pk) {
-    headers.set("Authorization", `Bearer ${pk}`);
+  } else if (gatewayJwt) {
+    headers.set("Authorization", `Bearer ${gatewayJwt}`);
+  } else if (fallbackBearer) {
+    headers.set("Authorization", `Bearer ${fallbackBearer}`);
   }
 }
 
@@ -1059,10 +1104,10 @@ const STOCKGAME_SUPABASE_SESSION_INVALID = "SESSION_INVALID";
 /** 署名検証なしでセッショントークン payload の sub（ユーザー UUID）だけ取り出す（サーバー削除時のローカル整合用） */
 function decodeSupabaseSessionSubUnverified(token) {
   if (typeof token !== "string" || !token) return null;
-  const i = token.indexOf(".");
-  if (i <= 0) return null;
+  const parts = token.split(".");
+  if (parts.length < 2) return null;
   try {
-    const payloadB64 = token.slice(0, i);
+    let payloadB64 = parts[1];
     const pad = "=".repeat((4 - (payloadB64.length % 4)) % 4);
     const b64 = payloadB64.replace(/-/g, "+").replace(/_/g, "/") + pad;
     const bin = atob(b64);
@@ -1191,21 +1236,37 @@ async function notifySupabaseLogoutBestEffort(tokenOverride) {
   }
 }
 
+const STOCKGAME_SUPABASE_FETCH_TIMEOUT_MS = 25000;
+
+function assertSafeSupabaseEdgePath(path) {
+  const p = String(path || "").replace(/^\//, "");
+  if (!/^[a-z][a-z0-9-]*$/.test(p)) {
+    throw new Error("無効な API パスです。");
+  }
+  return p;
+}
+
 async function supabaseCloudFetch(path, init = {}) {
   const cfg = getSupabaseCloudConfig();
   if (!cfg) throw new Error("Supabase クラウドが無効です。");
+  const safePath = assertSafeSupabaseEdgePath(path);
   const headers = new Headers(init.headers || {});
   headers.set("Content-Type", "application/json");
   setSupabaseEdgeFetchHeaders(headers, cfg);
-  const url = `${cfg.functionsBaseUrl}/${String(path || "").replace(/^\//, "")}`;
-  const res = await fetch(url, {
+  const url = `${cfg.functionsBaseUrl}/${safePath}`;
+  const fetchOpts = {
     method: init.method || "POST",
     mode: "cors",
     credentials: "omit",
     headers,
-    body: init.body != null ? init.body : undefined,
-    signal: init.signal
-  });
+    body: init.body != null ? init.body : undefined
+  };
+  if (init.signal) {
+    fetchOpts.signal = init.signal;
+  } else if (typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function") {
+    fetchOpts.signal = AbortSignal.timeout(STOCKGAME_SUPABASE_FETCH_TIMEOUT_MS);
+  }
+  const res = await fetch(url, fetchOpts);
   const text = await res.text();
   let data = null;
   try {
@@ -1334,12 +1395,30 @@ async function pushSupabaseCloudState() {
   const token = getSupabaseSessionToken();
   if (!token) return;
   try {
-    const clone = JSON.parse(buildCloudPayloadJson(app.state));
+    const json = buildCloudPayloadJson(app.state);
+    if (json.length > CONFIG.cloudPayloadMaxChars) {
+      if (typeof showGlobalNotice === "function") {
+        showGlobalNotice(
+          "保存データが大きすぎるためクラウドへ同期できませんでした。しばらく利用してキャッシュが整理されたあと、再保存をお試しください。",
+          true
+        );
+      }
+      console.warn("supabase cloud push skipped: payload too large");
+      return;
+    }
+    const clone = JSON.parse(json);
     await supabaseCloudFetch("save-state", {
       body: JSON.stringify({ state: clone })
     });
   } catch (e) {
     console.warn("supabase cloud push failed", e);
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/大きすぎ|413|too large/i.test(msg) && typeof showGlobalNotice === "function") {
+      showGlobalNotice(
+        "クラウドへの保存が拒否されました（データサイズ超過）。履歴の古い月が自動整理されるまでお待ちください。",
+        true
+      );
+    }
   }
 }
 
@@ -1466,6 +1545,8 @@ async function cloudPullIfNewer() {
 /** Safari と Chrome など別ブラウザで保存された内容を、タブ復帰・定期ポーリングで取り込む */
 function startCloudSyncPullLoop() {
   if (!getCloudSyncBackend()) return;
+  if (app._cloudSyncPullLoopRegistered) return;
+  app._cloudSyncPullLoopRegistered = true;
   let busy = false;
   const run = async () => {
     if (!app.initialized || busy || document.visibilityState !== "visible") return;
@@ -1473,8 +1554,12 @@ function startCloudSyncPullLoop() {
     try {
       const applied = await cloudPullIfNewer();
       if (applied) renderAll();
-    } catch (_) {}
-    busy = false;
+      await rollSeasonIfNeeded();
+      renderAll();
+    } catch (_) {
+    } finally {
+      busy = false;
+    }
   };
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") void run();
@@ -1549,12 +1634,15 @@ async function initializeApp() {
     } else {
       void refreshDailyPricesIfNeeded().catch((err) => console.error("background refresh failed", err));
     }
-    startRankingAutoRefreshTimer();
-    startJpAutoUpdateTimers();
-    startUsAutoUpdateTimers();
-    startCryptoAutoUpdateTimers();
-    startPendingAutoFixTimer();
-    startCloudSyncPullLoop();
+    if (!app._backgroundTimersStarted) {
+      app._backgroundTimersStarted = true;
+      startRankingAutoRefreshTimer();
+      startJpAutoUpdateTimers();
+      startUsAutoUpdateTimers();
+      startCryptoAutoUpdateTimers();
+      startPendingAutoFixTimer();
+      startCloudSyncPullLoop();
+    }
   } catch (error) {
     console.error(error);
     showGlobalNotice("初期化に失敗しました。ページを再読み込みしてください。", true);
@@ -2055,7 +2143,6 @@ function getElements() {
     menuLoginBtn: byId("menuLoginBtn"),
     menuRegisterBtn: byId("menuRegisterBtn"),
     menuPickBtn: byId("menuPickBtn"),
-    menuHistoryBtn: byId("menuHistoryBtn"),
     menuCopySyncUrlBtn: byId("menuCopySyncUrlBtn"),
     topLogoutBtn: byId("topLogoutBtn"),
     menuPanelContainer: byId("menuPanelContainer"),
@@ -2174,7 +2261,6 @@ function wireEvents() {
   app.els.menuLoginBtn.addEventListener("click", onMenuLogin);
   app.els.menuRegisterBtn.addEventListener("click", onMenuRegister);
   app.els.menuPickBtn.addEventListener("click", onMenuPick);
-  app.els.menuHistoryBtn.addEventListener("click", onMenuHistory);
   app.els.topLogoutBtn.addEventListener("click", onLogout);
   if (app.els.menuCopySyncUrlBtn) app.els.menuCopySyncUrlBtn.addEventListener("click", onCopySyncUrlClick);
   app.els.authForm.addEventListener("submit", onAuthSubmit);
@@ -2204,6 +2290,8 @@ function wireEvents() {
   app.els.confirmPicksBtn.addEventListener("click", onConfirmPicksClick);
   app.els.marketType.addEventListener("change", () => {
     app.addPickBtnJustAdded = false;
+    app.symbolSuggestFreezeUntilEdit = false;
+    app.symbolSuggestFreezeBaseline = "";
     const mt = app.els.marketType.value;
     if (mt === "JP" || mt === "AUTO") void loadJpCompanyMaster();
     void updateSymbolSuggestions();
@@ -2211,6 +2299,7 @@ function wireEvents() {
   });
   app.els.symbolInput.addEventListener("input", () => {
     app.addPickBtnJustAdded = false;
+    updateActionAvailability();
     onSymbolInputInput();
   });
   app.els.symbolInput.addEventListener("focus", () => {
@@ -2271,7 +2360,7 @@ function wireEvents() {
       if (btn instanceof HTMLButtonElement) {
         e.preventDefault();
         e.stopPropagation();
-        runReportReasonClick(btn.getAttribute("data-reason") || "その他");
+        void runReportReasonClick(btn.getAttribute("data-reason") || "その他");
       }
     });
   }
@@ -2280,7 +2369,7 @@ function wireEvents() {
     if (btn instanceof HTMLButtonElement && app.els.reportReasonModal && !app.els.reportReasonModal.classList.contains("hidden")) {
       e.preventDefault();
       e.stopPropagation();
-      runReportReasonClick(btn.getAttribute("data-reason") || "その他");
+      void runReportReasonClick(btn.getAttribute("data-reason") || "その他");
     }
   }, true);
 
@@ -2303,11 +2392,11 @@ function wireEvents() {
     if (app.els.registerRulesOkBtn) app.els.registerRulesOkBtn.addEventListener("click", onRegisterRulesOk);
   }
 
-  function runReportReasonClick(reason) {
+  async function runReportReasonClick(reason) {
     const userId = app.pendingReportUserId;
     if (!userId) return;
     try {
-      reportUser(userId, reason);
+      await reportUser(userId, reason);
       showGlobalNotice("通報を記録しました。", false);
       if (app.els.reportReasonModal) {
         app.els.reportReasonModal.classList.add("hidden");
@@ -2355,6 +2444,8 @@ function renderHintChips() {
     }
     chip.textContent = displayName;
     chip.addEventListener("click", () => {
+      app.symbolSuggestFreezeUntilEdit = false;
+      app.symbolSuggestFreezeBaseline = "";
       app.els.symbolInput.value = symbolToInput;
       if (hintMarket === "JP" || hintMarket === "US" || hintMarket === "CRYPTO") {
         app.els.marketType.value = hintMarket;
@@ -2418,13 +2509,6 @@ function onMenuPick() {
   capturePickDraft(getCurrentUser());
   renderHintChips();
   renderAll();
-}
-
-function onMenuHistory() {
-  if (!confirmLeavePickView("ranking")) return;
-  setCurrentView("ranking");
-  renderAll();
-  app.els.historyCard.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function clonePicksForDraft(picks) {
@@ -2634,8 +2718,7 @@ function applyCurrentView() {
     app.els.menuRankingBtn,
     app.els.menuLoginBtn,
     app.els.menuRegisterBtn,
-    app.els.menuPickBtn,
-    app.els.menuHistoryBtn
+    app.els.menuPickBtn
   ].forEach((btn) => btn.classList.toggle("active", btn === activeBtn));
 }
 
@@ -2662,6 +2745,7 @@ function renderAll() {
   renderLiveRanking();
   renderHistorySelect();
   renderHistoryTable();
+  syncRankTableMenuColumnVisibility();
   if (app.els.rankLastUpdateLabel) {
     const at = app.state.lastRankUpdateAt;
     const d = app.state.lastDailyRefreshDate;
@@ -2679,6 +2763,14 @@ function renderAll() {
   }
   updateActionAvailability();
   applyCurrentView();
+}
+
+function syncRankTableMenuColumnVisibility() {
+  const on = Boolean(getCurrentUser());
+  const t1 = document.getElementById("liveRankTable");
+  const t2 = document.getElementById("historyTable");
+  if (t1) t1.classList.toggle("rank-menu-visible", on);
+  if (t2) t2.classList.toggle("rank-menu-visible", on);
 }
 
 function renderAuthPanels() {
@@ -2731,7 +2823,7 @@ function renderPickTable() {
   body.innerHTML = "";
 
   if (!user) {
-    body.innerHTML = `<tr class="pick-table-empty"><td colspan="7" data-label="">はじめるか、銘柄を選ぶか、これまでの結果を選択してください。</td></tr>`;
+    body.innerHTML = `<tr class="pick-table-empty"><td colspan="7" data-label="">はじめるか、銘柄を選ぶか、ランキングを表示してください。</td></tr>`;
     return;
   }
 
@@ -2956,7 +3048,7 @@ function buildLiveRankingSnapshotKey(ranking, season, currentUser) {
       r.note || ""
     ].join("\x1e");
   });
-  return `LRv8|${season}\n${lines.join("\n")}`;
+  return `LRv9|${season}|m${currentUser ? "1" : "0"}\n${lines.join("\n")}`;
 }
 
 /** アカウント表示名の文字数（ID は最大8文字・絵文字等は 1 字として数える） */
@@ -2979,6 +3071,18 @@ function renderAnonymousRankLabel(displayName, history) {
   const d = escapeHtml(String(displayName || "-"));
   const line1 = history ? "通報で匿名表示（履歴）" : "通報で匿名表示";
   return `<span class="tag-muted tag-muted--stacked"><span class="tag-muted__line1">${line1}</span><span class="tag-muted__line2">${d}</span></span>`;
+}
+
+/** ログイン時のみ詳細・通報・⋮ を表示（未ログインは空セル＋CSSで列ごと非表示） */
+function renderRankMenuCell(row, seasonKey, currentUser) {
+  if (!row.userId) return `<td class="col-menu" data-label=""></td>`;
+  if (!currentUser) return `<td class="col-menu" data-label=""></td>`;
+  const hasReportedByMe = (app.state.reports || []).some(
+    (r) => r.season === seasonKey && r.targetUserId === row.userId && r.reporterId === currentUser.id
+  );
+  const reportBtnClass = "rank-menu-report-btn hidden" + (hasReportedByMe ? " rank-menu-report-btn-hidden" : "");
+  const unreportBtnClass = "rank-menu-unreport-btn hidden" + (!hasReportedByMe ? " rank-menu-report-btn-hidden" : "");
+  return `<td class="col-menu" data-label="操作"><span class="rank-menu-wrap"><button type="button" class="rank-menu-detail-btn" data-action="open-rank-report">詳細</button><button type="button" class="${reportBtnClass}" data-action="report-rank" data-user-id="${escapeHtml(row.userId)}">通報する</button><button type="button" class="${unreportBtnClass}" data-action="unreport-rank" data-user-id="${escapeHtml(row.userId)}">通報を解除</button><button type="button" class="rank-menu-trigger" data-user-id="${escapeHtml(row.userId)}" aria-label="メニューを開く">\u22EE</button><div class="rank-menu-dropdown hidden"></div></span></td>`;
 }
 
 function renderLiveRanking() {
@@ -3021,12 +3125,7 @@ function renderLiveRanking() {
     const tradesCell = row.trades.length
       ? renderTradeDetails(row.trades)
       : `<span class="rank-note">${escapeHtml(row.note || "未取引・未確定")}</span>`;
-    const hasReportedByMe = currentUser && (app.state.reports || []).some((r) => r.season === season && r.targetUserId === row.userId && r.reporterId === currentUser.id);
-    const reportBtnClass = "rank-menu-report-btn hidden" + (hasReportedByMe ? " rank-menu-report-btn-hidden" : "");
-    const unreportBtnClass = "rank-menu-unreport-btn hidden" + (!hasReportedByMe ? " rank-menu-report-btn-hidden" : "");
-    const menuCell = row.userId
-      ? `<td class="col-menu" data-label="操作"><span class="rank-menu-wrap"><button type="button" class="rank-menu-detail-btn" data-action="open-rank-report">詳細</button><button type="button" class="${reportBtnClass}" data-action="report-rank" data-user-id="${escapeHtml(row.userId)}">通報する</button><button type="button" class="${unreportBtnClass}" data-action="unreport-rank" data-user-id="${escapeHtml(row.userId)}">通報を解除</button><button type="button" class="rank-menu-trigger" data-user-id="${escapeHtml(row.userId)}" aria-label="メニューを開く">\u22EE</button><div class="rank-menu-dropdown hidden"></div></span></td>`
-      : `<td class="col-menu" data-label=""></td>`;
+    const menuCell = renderRankMenuCell(row, season, currentUser);
     const rankBadge = displayRank ? renderRankBadge(displayRank) : "";
     const accountLenClass = rankAccountCellLenClass(row.displayName);
     tr.innerHTML = `
@@ -3057,9 +3156,10 @@ function renderHistorySelect() {
     const item = bySeason.get(season);
     const option = document.createElement("option");
     option.value = season;
-    option.textContent = item
-      ? `${formatSeasonLabel(season)} (${item.rows.length}件)`
-      : `${formatSeasonLabel(season)} (未確定)`;
+    option.textContent =
+      item && item.rows && item.rows.length
+        ? `${formatSeasonLabel(season)} (${item.rows.length}件)`
+        : formatSeasonLabel(season);
     select.appendChild(option);
   }
   select.disabled = false;
@@ -3084,10 +3184,9 @@ function renderHistoryTable() {
 
   const target = app.state.rankings.find((x) => x.season === season);
   if (!target || !target.rows.length) {
-    body.innerHTML = `<tr class="rank-table-empty"><td colspan="6" data-label="">${formatSeasonLabel(season)} の取引データがありません。</td></tr>`;
-    app.els.historyMeta.textContent = target
-      ? `確定日時 ${formatDateTimeJst(target.settledAt)} / 確定ランキング 36か月`
-      : "確定ランキング 36か月";
+    body.innerHTML = `<tr class="rank-table-empty"><td colspan="6" data-label="">${escapeHtml(formatSeasonLabel(season))} の取引データがありません。</td></tr>`;
+    app.els.historyMeta.textContent =
+      target && target.settledAt ? `確定日時 ${formatDateTimeJst(target.settledAt)}` : "";
     return;
   }
 
@@ -3102,12 +3201,7 @@ function renderHistoryTable() {
     const accountHtml = row.isAnonymized
       ? renderAnonymousRankLabel(histName, true)
       : escapeHtml(histName);
-    const hasReportedByMe = currentUser && (app.state.reports || []).some((r) => r.season === season && r.targetUserId === row.userId && r.reporterId === currentUser.id);
-    const reportBtnClass = "rank-menu-report-btn hidden" + (hasReportedByMe ? " rank-menu-report-btn-hidden" : "");
-    const unreportBtnClass = "rank-menu-unreport-btn hidden" + (!hasReportedByMe ? " rank-menu-report-btn-hidden" : "");
-    const menuCell = row.userId
-      ? `<td class="col-menu" data-label="操作"><span class="rank-menu-wrap"><button type="button" class="rank-menu-detail-btn" data-action="open-rank-report">詳細</button><button type="button" class="${reportBtnClass}" data-action="report-rank" data-user-id="${escapeHtml(row.userId)}">通報する</button><button type="button" class="${unreportBtnClass}" data-action="unreport-rank" data-user-id="${escapeHtml(row.userId)}">通報を解除</button><button type="button" class="rank-menu-trigger" data-user-id="${escapeHtml(row.userId)}" aria-label="メニューを開く">\u22EE</button><div class="rank-menu-dropdown hidden"></div></span></td>`
-      : `<td class="col-menu" data-label=""></td>`;
+    const menuCell = renderRankMenuCell(row, season, currentUser);
     const rankBadge = renderRankBadge(rank);
     const histSymParts = (row.symbols || []).map((s) => escapeHtml(getSymbolDisplayName(s) || s)).filter(Boolean);
     const historySymbolsHtml = histSymParts.length
@@ -3128,7 +3222,9 @@ function renderHistoryTable() {
     body.appendChild(tr);
   });
 
-  app.els.historyMeta.textContent = `確定日時 ${formatDateTimeJst(target.settledAt)} / 確定ランキング 36か月`;
+  app.els.historyMeta.textContent = target.settledAt
+    ? `確定日時 ${formatDateTimeJst(target.settledAt)}`
+    : "";
 }
 
 function renderReportTable() {
@@ -3175,7 +3271,6 @@ function updateActionAvailability() {
 
   app.els.menuLoginBtn.textContent = user ? "マイページ" : "ログイン";
   app.els.menuRegisterBtn.classList.toggle("hidden", Boolean(user));
-  app.els.menuHistoryBtn.classList.add("hidden");
   app.els.topLogoutBtn.classList.toggle("hidden", !user);
   app.els.topLogoutBtn.disabled = !user;
   app.els.menuPickBtn.disabled = !user;
@@ -3281,8 +3376,13 @@ async function onAuthSubmit(event) {
   try {
     setBusy(true);
     await guardedSubmit("auth", async () => {
-      await rollSeasonIfNeeded();
+      if (!getSupabaseCloudConfig()) {
+        await rollSeasonIfNeeded();
+      }
       await loginAccount(name, password);
+      if (getSupabaseCloudConfig()) {
+        await rollSeasonIfNeeded();
+      }
       setMessage(app.els.authMessage, "ログインしました。", false);
       app.els.authPassword.value = "";
       app.els.authPasswordConfirm.value = "";
@@ -3498,7 +3598,9 @@ async function onRenameSubmit(event) {
 
   try {
     await renameAccount(user.id, nextName);
-    setMessage(app.els.accountMessage, "アカウント名を変更しました。", false);
+    app.els.renameInput.value = "";
+    app.els.renameFormBlock.classList.add("hidden");
+    setAccountChangeDoneMessage(app.els.accountMessage, "アカウント名（ID）を変更しました。上の「ログイン中」表示をご確認ください。");
     renderAll();
   } catch (error) {
     setMessage(app.els.accountMessage, normalizeErrorMessage(error), true);
@@ -3539,6 +3641,15 @@ async function onChangePasswordSubmit(event) {
     return;
   }
   try {
+    await rollSeasonIfNeeded();
+  } catch (_) {}
+  const userAfterRoll = getCurrentUser();
+  if (!userAfterRoll || userAfterRoll.id !== user.id) {
+    setMessage(app.els.accountMessage, "対戦月が切り替わったかセッションが無効です。再度ログインしてください。", true);
+    renderAll();
+    return;
+  }
+  try {
     if (String(user.passwordAlgo || "") === "remote" && getSupabaseCloudConfig()) {
       await supabaseCloudFetch("change-password", {
         body: JSON.stringify({ currentPassword, newPassword })
@@ -3561,7 +3672,9 @@ async function onChangePasswordSubmit(event) {
     app.els.currentPasswordInput.value = "";
     app.els.nextPasswordInput.value = "";
     app.els.nextPasswordConfirmInput.value = "";
-    setMessage(app.els.accountMessage, "パスワードを変更しました。", false);
+    app.els.changePasswordFormBlock.classList.add("hidden");
+    setAccountChangeDoneMessage(app.els.accountMessage, "パスワードを変更しました。");
+    renderAll();
   } catch (error) {
     setMessage(app.els.accountMessage, normalizeErrorMessage(error), true);
   }
@@ -3597,7 +3710,10 @@ function toggleAccountForm(which) {
   }
 }
 
-function onUndoPickClick() {
+async function onUndoPickClick() {
+  try {
+    await rollSeasonIfNeeded();
+  } catch (_) {}
   const user = getCurrentUser();
   if (!user) return;
   const rlUndo = getClientRateLimitMessageIfRejected(
@@ -3705,7 +3821,7 @@ function onDownloadReportClick() {
     </thead>
     <tbody>${rowsHtml}</tbody>
   </table>
-  <div class="foot">売買履歴と今月の成果。確定ランキング 36か月分。</div>
+  <div class="foot">売買履歴と今月の成果。</div>
 </body>
 </html>`;
 
@@ -3808,19 +3924,36 @@ async function onDeleteAccountClick() {
     setMessage(app.els.accountMessage, "ログインしてください。", true);
     return;
   }
+  const userId = user.id;
   const ok1 = confirm("アカウントを削除すると、今月のランキング・保有銘柄・通報履歴などの関連データも消去され、復元できません。\n\n本当に削除しますか？（1回目）");
   if (!ok1) return;
   const ok2 = confirm("削除すると元に戻せません。もう一度「OK」を押すとアカウントが削除されます。（2回目）");
   if (!ok2) return;
-  purgeUserCompletely(user.id);
+  // API や purge より先に枠を解放（401 でユーザーが先に消えると release が効かない取りこぼしを防ぐ）
+  releaseDeviceSeasonSlotForDeletedUser(user);
+  releaseDeviceSeasonSlotForThisBrowserThisMonth();
+  let serverDeleted = false;
+  if (getSupabaseCloudConfig()) {
+    try {
+      await supabaseCloudFetch("delete-account", { body: "{}" });
+      serverDeleted = true;
+    } catch (e) {
+      console.warn("delete-account edge failed", e);
+    }
+  } else {
+    serverDeleted = true;
+  }
+  purgeUserCompletely(userId);
 
   saveState();
   clearMessage(app.els.accountMessage);
-  setMessage(app.els.accountMessage, "アカウントを削除しました。", false);
-  showGlobalNotice("", false);
+  const doneMsg = serverDeleted
+    ? "アカウントを削除しました。ランキング画面に戻りました。"
+    : "この端末の表示データを消去してログアウトしました。サーバー側の削除に失敗した場合、同じIDで再登録できないことがあります。Supabase に delete-account 関数をデプロイするか、ダッシュボードでユーザーを削除してください。";
   showPreview(null);
   setCurrentView("ranking");
   renderAll();
+  showGlobalNotice(doneMsg, !serverDeleted);
 }
 
 async function onPreviewClick() {
@@ -4028,6 +4161,8 @@ async function onPreviewClick() {
   } finally {
     app.interactiveFetch = false;
     setBusy(false);
+    app.addPickBtnJustAdded = false;
+    updateActionAvailability();
   }
 }
 
@@ -4113,6 +4248,12 @@ async function onConfirmPicksClick() {
   const user = getCurrentUser();
   if (!user) {
     setMessage(app.els.pickMessage, "ログインしてください。", true);
+    return;
+  }
+  try {
+    await ensureGameplaySeasonAlignedOrThrow();
+  } catch (e) {
+    setMessage(app.els.pickMessage, e instanceof Error ? e.message : "対戦月の確認に失敗しました。", true);
     return;
   }
 
@@ -4385,6 +4526,13 @@ async function onPickTableAction(event) {
   const user = getCurrentUser();
   if (!user) return;
 
+  try {
+    await ensureGameplaySeasonAlignedOrThrow();
+  } catch (e) {
+    setMessage(app.els.pickMessage, e instanceof Error ? e.message : "対戦月の確認に失敗しました。", true);
+    return;
+  }
+
   const rlTbl = getClientRateLimitMessageIfRejected(
     "pickAction",
     CONFIG.clientRatePickActionMax,
@@ -4452,7 +4600,7 @@ async function onPickTableAction(event) {
   }
 }
 
-function onReportTableAction(event) {
+async function onReportTableAction(event) {
   const target = event.target;
   if (!(target instanceof HTMLElement)) return;
   const action = target.dataset.action;
@@ -4462,6 +4610,9 @@ function onReportTableAction(event) {
     setMessage(app.els.reportMessage, "ログインしてください。", true);
     return;
   }
+  try {
+    await rollSeasonIfNeeded();
+  } catch (_) {}
   const userId = target.dataset.userId;
   if (!userId) return;
   const season = app.state.currentSeason || getSeasonKeyJst(new Date());
@@ -4548,13 +4699,15 @@ function onLiveRankBodyClick(event) {
     if (userId && reporter) {
       document.querySelectorAll(".rank-menu-dropdown").forEach((el) => el.classList.add("hidden"));
       document.querySelectorAll(".rank-menu-report-btn, .rank-menu-unreport-btn").forEach((el) => el.classList.add("hidden"));
-      try {
-        removeReportByReporter(reporter.id, userId);
-        showGlobalNotice("通報を解除しました。", false);
-        renderAll();
-      } catch (error) {
-        showGlobalNotice(error instanceof Error ? error.message : "解除に失敗しました。", true);
-      }
+      void (async () => {
+        try {
+          await removeReportByReporter(reporter.id, userId);
+          showGlobalNotice("通報を解除しました。", false);
+          renderAll();
+        } catch (error) {
+          showGlobalNotice(error instanceof Error ? error.message : "解除に失敗しました。", true);
+        }
+      })();
     }
     return;
   }
@@ -4615,7 +4768,11 @@ function openRankReportModal(row, season) {
   const displayName = escapeHtml(row.displayName || row.name || "-");
   const seasonLabel = formatSeasonLabel(season);
   if (app.els.rankReportTitle) app.els.rankReportTitle.textContent = `${row.displayName || row.name || "-"} のレポート（${seasonLabel}）`;
-  if (app.els.rankReportMeta) app.els.rankReportMeta.textContent = `${seasonLabel} のリターン: ${formatPct(row.returnPct)}（先月のランキング）`;
+  const curSeason = app.state.currentSeason || getSeasonKeyJst(new Date());
+  const metaKind = String(season) === String(curSeason) ? "当月暫定ランキング" : "確定ランキング（過去月）";
+  if (app.els.rankReportMeta) {
+    app.els.rankReportMeta.textContent = `${seasonLabel} のリターン: ${formatPct(row.returnPct)}（${metaKind}）`;
+  }
   const resultEl = document.querySelector("#rankReportModal .rank-report-result");
   if (resultEl) resultEl.textContent = "";
   const body = app.els.rankReportBody;
@@ -4669,6 +4826,8 @@ function onRankReportPdfClick() {
   }).join("");
   const safeName = String(row.displayName || row.name || "ranking").replace(/[<>"&]/g, "");
   const title = `売買履歴・成果_${safeName}_${season}`;
+  const curSeasonPdf = app.state.currentSeason || getSeasonKeyJst(new Date());
+  const pdfMetaKind = String(season) === String(curSeasonPdf) ? "当月暫定ランキング" : "確定ランキング（過去月）";
   const htmlContent = `<!doctype html>
 <html lang="ja">
 <head>
@@ -4689,7 +4848,7 @@ function onRankReportPdfClick() {
 <body>
   <div class="head">
     <h1>株のタカ 🦅 売買履歴・成果</h1>
-    <div class="meta">${escapeHtml(row.displayName || row.name || "-")} ／ ${formatSeasonLabel(season)} 先月のランキング</div>
+    <div class="meta">${escapeHtml(row.displayName || row.name || "-")} ／ ${formatSeasonLabel(season)} ${escapeHtml(pdfMetaKind)}</div>
     <div class="result-line">${formatSeasonLabel(season)} のリターン: <span style="color: ${getPdfPctColor(row.returnPct)};">${formatPct(row.returnPct)}</span></div>
   </div>
   <table>
@@ -4769,6 +4928,8 @@ function onSymbolInputInput() {
   // 「空欄への遷移」が起きたときだけ戻す（常時上書きしない）。
   const isEmpty = !app.els.symbolInput.value.trim();
   if (isEmpty && app.symbolInputWasEmpty !== true) {
+    app.symbolSuggestFreezeUntilEdit = false;
+    app.symbolSuggestFreezeBaseline = "";
     app.els.marketType.value = "AUTO";
     app.addPickBtnJustAdded = false;
     void updateSymbolSuggestions();
@@ -4808,12 +4969,21 @@ function onSymbolSuggestClick(event) {
   const symbol = button.dataset.symbol || "";
   const market = button.dataset.market || "AUTO";
   if (!symbol) return;
+  if (app.symbolSuggestTimer) {
+    clearTimeout(app.symbolSuggestTimer);
+    app.symbolSuggestTimer = 0;
+  }
   app.els.symbolInput.value = symbol;
   if (market === "JP" || market === "US" || market === "CRYPTO") {
     app.els.marketType.value = market;
   }
   hideSymbolSuggestions();
+  app.symbolSuggestFreezeUntilEdit = true;
+  app.symbolSuggestFreezeBaseline = sanitizePickInput(app.els.symbolInput.value);
   app.els.symbolInput.focus();
+  app.addPickBtnJustAdded = false;
+  updateActionAvailability();
+  app.symbolInputWasEmpty = !app.els.symbolInput.value.trim();
   const symU = symbol.toUpperCase();
   const mkt = market === "JP" || market === "US" || market === "CRYPTO" ? market : inferMarketFromKnownSymbol(symU);
   setChartLinkContext(symU, mkt);
@@ -4898,6 +5068,15 @@ function isCompleteSymbolForm(query) {
 
 async function updateSymbolSuggestions() {
   const query = sanitizePickInput(app.els.symbolInput.value);
+  if (app.symbolSuggestFreezeUntilEdit) {
+    const base = sanitizePickInput(app.symbolSuggestFreezeBaseline || "");
+    if (query === base) {
+      hideSymbolSuggestions();
+      return;
+    }
+    app.symbolSuggestFreezeUntilEdit = false;
+    app.symbolSuggestFreezeBaseline = "";
+  }
   if (!query) {
     hideSymbolSuggestions();
     return;
@@ -5087,7 +5266,8 @@ function canReport(reporter) {
   return hasConfirmedPick;
 }
 
-function reportUser(targetUserId, reason) {
+async function reportUser(targetUserId, reason) {
+  await ensureGameplaySeasonAlignedOrThrow();
   const reporter = getCurrentUser();
   if (!reporter) throw new Error("ログイン後に通報できます。");
   const rlRep = getClientRateLimitMessageIfRejected(
@@ -5121,7 +5301,14 @@ function reportUser(targetUserId, reason) {
     (app.state.reports || []).filter((r) => r.reporterId === reporter.id && r.season === season).map((r) => r.aliasForReporter).filter(Boolean)
   );
   let aliasForReporter = generateAnimalAlias();
-  while (usedReporterAliases.has(aliasForReporter)) aliasForReporter = generateAnimalAlias();
+  let aliasGuard = 0;
+  while (usedReporterAliases.has(aliasForReporter) && aliasGuard < 48) {
+    aliasForReporter = generateAnimalAlias();
+    aliasGuard += 1;
+  }
+  if (usedReporterAliases.has(aliasForReporter)) {
+    aliasForReporter = "\u901a\u5831" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+  }
 
   const reasonSafe = sanitizeFreeTextForStorage(reason, CONFIG.maxReportReasonLength);
   app.state.reports.push({
@@ -5137,7 +5324,8 @@ function reportUser(targetUserId, reason) {
   saveState();
 }
 
-function removeReportByReporter(reporterId, targetUserId) {
+async function removeReportByReporter(reporterId, targetUserId) {
+  await rollSeasonIfNeeded();
   const rlUnrep = getClientRateLimitMessageIfRejected(
     "report",
     CONFIG.clientRateReportMax,
@@ -5198,12 +5386,10 @@ function removeUserSecurityLocksByNameKey(nameKey) {
 }
 
 function purgeUserCompletely(userId) {
+  if (!userId) return;
   const user = (app.state.users || []).find((u) => u && u.id === userId);
-  if (!userId || !user) return;
-
-  const userSeason = user.season;
-  const userDeviceId = user.registeredDeviceId || "";
-  const userNameKey = user.nameKey;
+  const userNameKey = user?.nameKey;
+  if (user) releaseDeviceSeasonSlotForDeletedUser(user);
 
   app.state.users = (app.state.users || []).filter((u) => u.id !== userId);
 
@@ -5231,11 +5417,7 @@ function purgeUserCompletely(userId) {
     if (typeof showPreview === "function") showPreview(null);
   }
 
-  removeUserSecurityLocksByNameKey(userNameKey);
-
-  // 削除後に同端末で再登録できるよう、現在端末・現在月も含めて同期する
-  if (userSeason && userDeviceId) syncDeviceRegistrationCountForSeason(userSeason, userDeviceId);
-  syncDeviceRegistrationCountForSeason(getSeasonKeyJst(new Date()), getDeviceId());
+  if (userNameKey) removeUserSecurityLocksByNameKey(userNameKey);
 }
 
 const MAX_TRADES_PER_SEASON = 40;
@@ -5359,24 +5541,91 @@ function countUsersForDeviceAndSeason(season, deviceId) {
   }).length;
 }
 
-// 同一端末・同一月で作成できるアカウント数（3以上を禁止 => 最大2）
-const MAX_REGISTRATIONS_PER_DEVICE_PER_MONTH = 2;
+// 同一端末・同一月で作成できるアカウント数（最大1）
+const MAX_REGISTRATIONS_PER_DEVICE_PER_MONTH = 1;
+
+function hydrateDeviceSeasonConsumedFromStorage(season, deviceId) {
+  if (!season || !deviceId || !app?.state?.security) return;
+  const k = buildDeviceSeasonKey(season, deviceId);
+  try {
+    if (localStorage.getItem("stockgame_device_month_slot_used_" + season + "_" + deviceId) === "1") {
+      if (!app.state.security.deviceSeasonConsumed || typeof app.state.security.deviceSeasonConsumed !== "object") {
+        app.state.security.deviceSeasonConsumed = {};
+      }
+      app.state.security.deviceSeasonConsumed[k] = true;
+    }
+  } catch (_) {}
+}
+
+function isDeviceSeasonSlotUsed(season, deviceId) {
+  if (!season || !deviceId) return false;
+  const k = buildDeviceSeasonKey(season, deviceId);
+  if (app?.state?.security?.deviceSeasonConsumed?.[k]) return true;
+  try {
+    return localStorage.getItem("stockgame_device_month_slot_used_" + season + "_" + deviceId) === "1";
+  } catch (_) {
+    return false;
+  }
+}
+
+function markDeviceSeasonConsumed(season, deviceId) {
+  if (!season || !deviceId) return;
+  if (!app.state.security) app.state.security = createDefaultSecurityState();
+  if (!app.state.security.deviceSeasonConsumed || typeof app.state.security.deviceSeasonConsumed !== "object") {
+    app.state.security.deviceSeasonConsumed = {};
+  }
+  const k = buildDeviceSeasonKey(season, deviceId);
+  app.state.security.deviceSeasonConsumed[k] = true;
+  try {
+    localStorage.setItem("stockgame_device_month_slot_used_" + season + "_" + deviceId, "1");
+  } catch (_) {}
+}
+
+/** 指定の対戦月×端末IDの登録枠を state / localStorage から除去 */
+function clearDeviceSeasonSlotForSeasonAndDevice(season, deviceId) {
+  const s = String(season || "").trim();
+  const d = String(deviceId || "").trim();
+  if (!s || !d || !/^\d{4}-\d{2}$/.test(s)) return;
+  if (!app?.state) return;
+  if (!app.state.security) app.state.security = createDefaultSecurityState();
+  const k = buildDeviceSeasonKey(s, d);
+  if (app.state.security.deviceSeasonConsumed && typeof app.state.security.deviceSeasonConsumed === "object") {
+    delete app.state.security.deviceSeasonConsumed[k];
+  }
+  if (app.state.security.deviceSeasonCounts && typeof app.state.security.deviceSeasonCounts === "object") {
+    delete app.state.security.deviceSeasonCounts[k];
+  }
+  try {
+    localStorage.removeItem("stockgame_device_month_slot_used_" + s + "_" + d);
+    localStorage.removeItem("stockgame_device_reg_" + s + "_" + d);
+  } catch (_) {}
+}
+
+/** 削除されたアカウントが使っていた端末×月の枠を解放 */
+function releaseDeviceSeasonSlotForDeletedUser(user) {
+  if (!user) return;
+  clearDeviceSeasonSlotForSeasonAndDevice(user.season, user.registeredDeviceId);
+}
+
+/** このブラウザの端末ID×今月（JST）の枠を解放（削除直後の再登録用） */
+function releaseDeviceSeasonSlotForThisBrowserThisMonth() {
+  clearDeviceSeasonSlotForSeasonAndDevice(getSeasonKeyJst(new Date()), getDeviceId());
+}
 
 function enforceDeviceRegistrationLimit() {
   const deviceId = getDeviceId();
   const season = getSeasonKeyJst(new Date());
-  // 旧バージョンの累計カウントが残っていると、削除後も上限判定だけが残ることがあるため
-  // ここで「今残っている人数」を正として同期してから判定する。
-  syncDeviceRegistrationCountForSeason(season, deviceId);
-  const storageKey = "stockgame_device_reg_" + season + "_" + deviceId;
-  const legacyCount = parseInt(localStorage.getItem(storageKey) || "0", 10) || 0;
-  const stateKey = buildDeviceSeasonKey(season, deviceId);
-  const stateCount = Number(app?.state?.security?.deviceSeasonCounts?.[stateKey] || 0);
-  const linkedCount = countUsersForDeviceAndSeason(season, deviceId);
-  // 上限判定は「今この端末で今月残っているアカウント数」を正とする。
-  // legacy/state は旧方式互換のために残しているが、上限ブロックに使うと復旧不能になりやすい。
-  const usedCount = linkedCount;
-  if (usedCount >= MAX_REGISTRATIONS_PER_DEVICE_PER_MONTH) {
+  hydrateDeviceSeasonConsumedFromStorage(season, deviceId);
+  let linkedCount = countUsersForDeviceAndSeason(season, deviceId);
+  // 同月・同端末の残アカウントが誰もいないのに枠だけ残っている（削除フローで取りこぼし等）なら掃除
+  if (linkedCount === 0 && isDeviceSeasonSlotUsed(season, deviceId)) {
+    clearDeviceSeasonSlotForSeasonAndDevice(season, deviceId);
+  }
+  linkedCount = countUsersForDeviceAndSeason(season, deviceId);
+  if (isDeviceSeasonSlotUsed(season, deviceId)) {
+    throw new Error(`この端末では今月の新規登録上限（${MAX_REGISTRATIONS_PER_DEVICE_PER_MONTH}件）に達しています。`);
+  }
+  if (linkedCount >= MAX_REGISTRATIONS_PER_DEVICE_PER_MONTH) {
     throw new Error(`この端末では今月の新規登録上限（${MAX_REGISTRATIONS_PER_DEVICE_PER_MONTH}件）に達しています。`);
   }
 }
@@ -5404,6 +5653,7 @@ function syncDeviceRegistrationCountForSeason(season, deviceId) {
 function recordDeviceRegistration() {
   const deviceId = getDeviceId();
   const season = getSeasonKeyJst(new Date());
+  markDeviceSeasonConsumed(season, deviceId);
   const storageKey = "stockgame_device_reg_" + season + "_" + deviceId;
   const count = parseInt(localStorage.getItem(storageKey) || "0", 10) || 0;
   localStorage.setItem(storageKey, String(count + 1));
@@ -5575,9 +5825,21 @@ async function loginAccount(name, password) {
     if (!data?.sessionToken || !data?.state || !data?.user?.id) {
       throw new Error("サーバーからのログイン応答が不正です。");
     }
+    const seasonNow = getSeasonKeyJst(new Date());
+    const normalized = normalizeState(data.state);
+    const uid = data.user.id;
+    const rowUser = (normalized.users || []).find((x) => x && x.id === uid);
+    if (!rowUser || String(rowUser.season || "") !== String(seasonNow)) {
+      throw new Error(
+        "このアカウントは先月以前の対象月のままです。今月の参加には、新しいアカウントを登録してください。"
+      );
+    }
+    if (String(normalized.currentSeason || "") !== String(seasonNow)) {
+      normalized.currentSeason = seasonNow;
+    }
     setSupabaseSessionToken(data.sessionToken);
     clearFailedLogin(key);
-    app.state = normalizeState(data.state);
+    app.state = normalized;
     app.sessionUserId = data.user.id;
     app.state.sessionUserId = data.user.id;
     saveState();
@@ -5597,6 +5859,12 @@ async function loginAccount(name, password) {
   if (!ok) {
     recordFailedLogin(key);
     throw new Error("IDまたはパスワードが正しくありません。");
+  }
+
+  const seasonNowLocal = getSeasonKeyJst(new Date());
+  if (user.season && String(user.season) !== String(seasonNowLocal)) {
+    recordFailedLogin(key);
+    throw new Error("このアカウントは先月までのものです。今月用に新しいアカウントを作成してください。");
   }
 
   clearFailedLogin(key);
@@ -5652,6 +5920,7 @@ async function resetPasswordByRecovery(name, recoveryQuestionId, recoveryAnswer,
 }
 
 async function renameAccount(userId, nextName) {
+  await rollSeasonIfNeeded();
   const user = app.state.users.find((x) => x.id === userId);
   if (!user) throw new Error("ランキングユーザーが見つかりません。");
   if (user.isDeleted) throw new Error("削除済みのためランキングから操作できません。");
@@ -5679,6 +5948,7 @@ async function renameAccount(userId, nextName) {
 }
 
 async function addPickToCurrentUser(resolved) {
+  await ensureGameplaySeasonAlignedOrThrow();
   const user = getCurrentUser();
   if (!user) throw new Error("ログイン後に銘柄を追加してください。");
   if (user.isDeleted) throw new Error("削除済みのためランキングから操作できません。");
@@ -5782,6 +6052,7 @@ async function addPickToCurrentUser(resolved) {
 }
 
 async function sellPickForCurrentUser(pickId) {
+  await ensureGameplaySeasonAlignedOrThrow();
   const user = getCurrentUser();
   if (!user) throw new Error("ログイン後に売却できます。");
   if (user.isDeleted) throw new Error("削除済みのためランキングから操作できません。");
@@ -6264,52 +6535,91 @@ function getLatestFromRows(rows) {
 }
 
 async function rollSeasonIfNeeded() {
-  const nowSeason = getSeasonKeyJst(new Date());
-  if (!app.state.currentSeason) {
-    app.state.currentSeason = nowSeason;
-    saveState();
-    return;
-  }
+  if (app._rollSeasonPromise) return app._rollSeasonPromise;
+  app._rollSeasonPromise = (async () => {
+    try {
+      const nowSeason = getSeasonKeyJst(new Date());
+      if (!app.state.currentSeason) {
+        app.state.currentSeason = nowSeason;
+        saveState();
+        return;
+      }
 
-  if (app.state.currentSeason === nowSeason) return;
-  const oldSeason = app.state.currentSeason;
+      if (app.state.currentSeason === nowSeason) return;
 
-  /* 月初めの初回実行時に前月を確定し、全アカウント・通報をクリアする。ランキング（確定済み履歴）は app.state.rankings に残る。月末23:59の自動実行は行わず、月が変わったあと誰かがページを開く・ログインする・ランキング更新するタイミングで実行される。 */
-  try {
-    await settleSeason(oldSeason);
-  } catch (error) {
-    console.error("settleSeason failed", error);
-    settleSeasonFallback(oldSeason);
-  }
+      if (!/^\d{4}-\d{2}$/.test(String(app.state.currentSeason || ""))) {
+        app.state.currentSeason = nowSeason;
+        saveState();
+        showGlobalNotice("保存されていた対戦月の形式が不正だったため、今月に合わせて修正しました。", true);
+        return;
+      }
 
-  // 前月のユーザーデータを退避（後からレポート確認できるように）
-  try {
-    if (!app.state.archivedUsers || typeof app.state.archivedUsers !== "object") app.state.archivedUsers = {};
-    if (!app.state.archivedUsers[oldSeason]) {
-      app.state.archivedUsers[oldSeason] = (app.state.users || []).map((u) => ({
-        ...u,
-        picks: (u.picks || []).map((p) => ({ ...p }))
-      }));
+      const nowIdx = seasonToIndex(nowSeason);
+      const curIdx = seasonToIndex(app.state.currentSeason);
+      if (!Number.isFinite(curIdx)) {
+        app.state.currentSeason = nowSeason;
+        saveState();
+        showGlobalNotice("保存されていた対戦月が解釈できなかったため、今月に合わせて修正しました。", true);
+        return;
+      }
+      if (curIdx > nowIdx) {
+        app.state.currentSeason = nowSeason;
+        saveState();
+        showGlobalNotice("保存されていた対戦月が未来日付のため、今月に合わせて修正しました。", true);
+        return;
+      }
+
+      const oldSeason = app.state.currentSeason;
+
+      /* 月初めの初回実行時に前月を確定し、全アカウント・通報をクリアする。確定履歴は rankings に残る。
+       * 長期未利用で数か月ぶりに開いた場合でも、保存中の「直前の対戦月」を1回確定してから今月へ移行する。
+       * （中間の空月はローカルにプレイデータが無いためスキップされる。）
+       * archivedUsers への全ユーザー複製は未使用かつ容量を圧迫するため行わない。 */
+      try {
+        await settleSeason(oldSeason);
+      } catch (error) {
+        console.error("settleSeason failed", error);
+        settleSeasonFallback(oldSeason);
+      }
+
+      try {
+        if (!app.state.archivedUsers || typeof app.state.archivedUsers !== "object") app.state.archivedUsers = {};
+        const minIndex = seasonToIndex(getSeasonKeyJst(new Date())) - (CONFIG.rankingKeepMonths - 1);
+        for (const seasonKey of Object.keys(app.state.archivedUsers || {})) {
+          if (seasonToIndex(seasonKey) < minIndex) delete app.state.archivedUsers[seasonKey];
+        }
+      } catch (_) {}
+
+      app.state.users = [];
+      app.state.reports = [];
+      const prevSecurity = app.state.security || createDefaultSecurityState();
+      app.state.security = createDefaultSecurityState();
+      app.state.security.deviceSeasonConsumed = prevSecurity.deviceSeasonConsumed || {};
+      app.state.security.deviceSeasonCounts = prevSecurity.deviceSeasonCounts || {};
+      app.state.currentSeason = nowSeason;
+      app.state.lastDailyRefreshDate = "";
+      app.state.lastRankUpdateAt = "";
+      app.state.sessionUserId = null;
+      app.sessionUserId = null;
+      saveState();
+
+      showGlobalNotice(`${formatSeasonLabel(oldSeason)}を確定しました。${formatSeasonLabel(nowSeason)}を開始しました。`, false);
+    } finally {
+      app._rollSeasonPromise = null;
     }
+  })();
+  return app._rollSeasonPromise;
+}
 
-    // localStorage 破綻を防ぐため、アーカイブもランキング保持期間相当でトリムする
-    const minIndex = seasonToIndex(getSeasonKeyJst(new Date())) - (CONFIG.rankingKeepMonths - 1);
-    for (const seasonKey of Object.keys(app.state.archivedUsers || {})) {
-      if (seasonToIndex(seasonKey) < minIndex) delete app.state.archivedUsers[seasonKey];
-    }
-  } catch (_) {}
-
-  app.state.users = [];
-  app.state.reports = [];
-  app.state.security = createDefaultSecurityState();
-  app.state.currentSeason = nowSeason;
-  app.state.lastDailyRefreshDate = "";
-  app.state.lastRankUpdateAt = "";
-  app.state.sessionUserId = null;
-  app.sessionUserId = null;
-  saveState();
-
-  showGlobalNotice(`${formatSeasonLabel(oldSeason)}を確定しました。${formatSeasonLabel(nowSeason)}を開始しました。`, false);
+/** タブ放置で月が変わったあとも、売買・通報前に確実にロールしログインユーザーの対戦月と整合させる */
+async function ensureGameplaySeasonAlignedOrThrow() {
+  await rollSeasonIfNeeded();
+  const user = getCurrentUser();
+  if (!user) return;
+  const season = app.state.currentSeason || getSeasonKeyJst(new Date());
+  if (String(user.season || "") !== String(season)) {
+    throw new Error("対戦月が切り替わりました。ページを再読み込みするか、今月用アカウントでログインしてください。");
+  }
 }
 
 async function settleSeason(season) {
@@ -6334,7 +6644,7 @@ async function settleSeason(season) {
   const rowsBySymbol = new Map();
   for (const symbol of symbols) {
     try {
-      const history = await fetchHistory(symbol, true);
+      const history = await fetchHistory(symbol, true, season);
       rowsBySymbol.set(symbol, history.rows);
     } catch (error) {
       const cached = app.state.apiCache.history[symbol];
@@ -6590,9 +6900,31 @@ async function fetchQuote(symbol, force) {
   throw merged;
 }
 
-async function fetchHistory(symbol, force) {
+/** 月次確定など「過去の特定月」の日足を取るため、JST で対象月±pad 日を Unix 範囲にする */
+function getUnixRangeForSeasonChart(seasonKey, padDays = 21) {
+  const first = getSeasonFirstDateKey(seasonKey);
+  const last = getSeasonLastDateKey(seasonKey);
+  if (!first || !last) return null;
+  const startKey = shiftDateKey(first, -padDays);
+  const endKey = shiftDateKey(last, padDays);
+  const isoStart = isoFromZoneLocal(startKey, "00:00:00", "Asia/Tokyo");
+  const isoEnd = isoFromZoneLocal(endKey, "23:59:59", "Asia/Tokyo");
+  const t1 = Math.floor(Date.parse(isoStart) / 1000);
+  const t2 = Math.floor(Date.parse(isoEnd) / 1000);
+  if (!Number.isFinite(t1) || !Number.isFinite(t2) || t2 <= t1) return null;
+  return { period1: t1, period2: t2 };
+}
+
+/**
+ * @param {string} symbol
+ * @param {boolean} force
+ * @param {string} [settleSeasonKey] 月次確定時のみ: Yahoo の range=3mo では足りない過去月を period1/2 で取得
+ */
+async function fetchHistory(symbol, force, settleSeasonKey) {
   const cache = app.state.apiCache.history[symbol];
   const market = inferMarketFromKnownSymbol(symbol);
+  const settleKey =
+    typeof settleSeasonKey === "string" && /^\d{4}-\d{2}$/.test(settleSeasonKey) ? settleSeasonKey : "";
 
   // CRYPTO は Yahoo を使わず（CryptoCompareのみ）履歴を取る。
   // force=true でも Yahoo 側を触らないことで、余計な負荷/失敗を防ぐ。
@@ -6600,8 +6932,15 @@ async function fetchHistory(symbol, force) {
     if (!force && cache && Date.now() - cache.ts < CONFIG.historyTtlMs && Array.isArray(cache.rows)) {
       return { symbol, rows: cache.rows };
     }
+    const crOpts =
+      force && settleKey
+        ? (() => {
+            const r = getUnixRangeForSeasonChart(settleKey);
+            return r ? { toTs: r.period2, limit: 2000 } : {};
+          })()
+        : {};
     try {
-      const rows = await fetchHistoryFromCryptoCompare(symbol);
+      const rows = await fetchHistoryFromCryptoCompare(symbol, crOpts);
       cacheHistoryRows(symbol, rows);
       app.lastApiFailure = null;
       return { symbol, rows: app.state.apiCache.history[symbol].rows };
@@ -6619,8 +6958,12 @@ async function fetchHistory(symbol, force) {
   }
 
   const attempts = [];
+  const rangeForSettle = force && settleKey ? getUnixRangeForSeasonChart(settleKey) : null;
+  const rangeParam = rangeForSettle
+    ? `period1=${rangeForSettle.period1}&period2=${rangeForSettle.period2}`
+    : "range=3mo";
   const urls = [
-    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&range=3mo`
+    `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&${rangeParam}`
   ];
 
   // Yahoo 利用不可（市場時間外など）なら、疑似履歴を作らずキャッシュ履歴を返す
@@ -6773,9 +7116,13 @@ async function fetchHistoryFallback(symbol, attempts = []) {
   throw buildApiError("株価APIの履歴取得に失敗しました。", "history", symbol, attempts, err);
 }
 
-async function fetchHistoryFromCryptoCompare(symbol) {
+async function fetchHistoryFromCryptoCompare(symbol, opts) {
+  const options = opts && typeof opts === "object" ? opts : {};
   const base = symbol.replace(/-USD$/i, "").toUpperCase();
-  const url = `https://min-api.cryptocompare.com/data/v2/histoday?fsym=${encodeURIComponent(base)}&tsym=USD&limit=220`;
+  const limit = Math.min(2000, Math.max(1, Number(options.limit) || 220));
+  let url = `https://min-api.cryptocompare.com/data/v2/histoday?fsym=${encodeURIComponent(base)}&tsym=USD&limit=${limit}`;
+  const toTs = Number(options.toTs);
+  if (Number.isFinite(toTs) && toTs > 0) url += `&toTs=${Math.floor(toTs)}`;
   const json = await queuedFetchJson(url);
   const arr = Array.isArray(json?.Data?.Data) ? json.Data.Data : [];
   const rows = [];
@@ -7764,6 +8111,7 @@ function createDefaultSecurityState() {
     lockCount: {},
     registrationTimestamps: [],
     deviceSeasonCounts: {},
+    deviceSeasonConsumed: {},
     autoFix: {
       lastRunAt: 0,
       lastBySymbol: {},
@@ -7782,6 +8130,11 @@ function normalizeState(source) {
 
   state.schemaVersion = Number(source.schemaVersion) || CONFIG.schemaVersion;
   state.currentSeason = typeof source.currentSeason === "string" ? source.currentSeason : state.currentSeason;
+  if (typeof state.currentSeason === "string" && state.currentSeason) {
+    if (!/^\d{4}-\d{2}$/.test(state.currentSeason) || !Number.isFinite(seasonToIndex(state.currentSeason))) {
+      state.currentSeason = getSeasonKeyJst(new Date());
+    }
+  }
   state.lastDailyRefreshDate = typeof source.lastDailyRefreshDate === "string" ? source.lastDailyRefreshDate : "";
   state.lastRankUpdateAt = typeof source.lastRankUpdateAt === "string" ? source.lastRankUpdateAt : "";
   const rawLastSaved = Number(source.lastSavedAtMs);
@@ -7800,6 +8153,10 @@ function normalizeState(source) {
     }
   } catch (_) {}
   let reports = Array.isArray(source.reports) ? source.reports.map(normalizeReport).filter(Boolean) : [];
+  try {
+    const minRepIdx = seasonToIndex(getSeasonKeyJst(new Date())) - (CONFIG.rankingKeepMonths - 1);
+    reports = reports.filter((r) => r && r.season && seasonToIndex(r.season) >= minRepIdx);
+  } catch (_) {}
   if (reports.length > maxReportsLoad) reports = reports.slice(-maxReportsLoad);
   state.reports = reports;
   let rankings = Array.isArray(source.rankings) ? source.rankings.filter(isValidRankingShape).map(normalizeRanking) : [];
@@ -7810,7 +8167,31 @@ function normalizeState(source) {
   state.security = normalizeSecurityState(source.security);
 
   trimRankingsInState(state);
+  seedDeviceSeasonConsumedFromUsers(state);
   return state;
+}
+
+function seedDeviceSeasonConsumedFromUsers(state) {
+  if (!state?.security) return;
+  const consumed = { ...(state.security.deviceSeasonConsumed || {}) };
+  for (const u of state.users || []) {
+    if (!u || u.isDeleted) continue;
+    const did = u.registeredDeviceId;
+    const se = u.season;
+    if (did && se) consumed[buildDeviceSeasonKey(se, did)] = true;
+  }
+  let minIdx = -Infinity;
+  try {
+    minIdx = seasonToIndex(getSeasonKeyJst(new Date())) - (CONFIG.rankingKeepMonths + 24);
+  } catch (_) {}
+  const trimmed = {};
+  for (const [k, v] of Object.entries(consumed)) {
+    if (!v) continue;
+    const m = String(k).match(/^(\d{4}-\d{2})::/);
+    if (m && seasonToIndex(m[1]) < minIdx) continue;
+    trimmed[k] = true;
+  }
+  state.security.deviceSeasonConsumed = trimmed;
 }
 
 function isValidUserShape(v) {
@@ -8019,34 +8400,64 @@ function pruneApiCache(apiCache, opts) {
 
 function normalizeSecurityState(security) {
   if (!security || typeof security !== "object") return createDefaultSecurityState();
+  const now = Date.now();
+  const windowMs = 60 * 60 * 1000;
+  const failedRetentionMs = 72 * 60 * 60 * 1000;
+  const lockStaleMs = 7 * 24 * 60 * 60 * 1000;
+  const maxFailedTimestampsPerKey = 32;
+
   const failed = {};
-  const lockUntil = {};
-  const lockCount = {};
   for (const [k, arr] of Object.entries(security.failed || {})) {
-    if (!Array.isArray(arr)) continue;
-    failed[k] = arr.filter((v) => Number.isFinite(v));
+    if (!Array.isArray(arr) || !k) continue;
+    const recent = arr
+      .filter((v) => Number.isFinite(v) && now - v < failedRetentionMs)
+      .slice(-maxFailedTimestampsPerKey);
+    if (recent.length) failed[k] = recent;
   }
+
+  const lockUntil = {};
   for (const [k, v] of Object.entries(security.lockUntil || {})) {
     if (!Number.isFinite(v)) continue;
+    if (v < now - lockStaleMs) continue;
     lockUntil[k] = v;
   }
+
+  const lockCount = {};
   for (const [k, v] of Object.entries(security.lockCount || {})) {
-    if (Number.isInteger(v) && v > 0) lockCount[k] = v;
+    if (!Number.isInteger(v) || v <= 0) continue;
+    if (!failed[k] && !lockUntil[k]) continue;
+    lockCount[k] = v;
   }
-  const windowMs = 60 * 60 * 1000;
-  const now = Date.now();
+
   const registrationTimestamps = Array.isArray(security.registrationTimestamps)
     ? security.registrationTimestamps.filter((t) => Number.isFinite(t) && now - t < windowMs)
     : [];
+
+  let minDevSeasonIdx = -Infinity;
+  try {
+    minDevSeasonIdx = seasonToIndex(getSeasonKeyJst(new Date())) - (CONFIG.rankingKeepMonths + 2);
+  } catch (_) {}
   const deviceSeasonCounts = {};
   if (security.deviceSeasonCounts && typeof security.deviceSeasonCounts === "object") {
     for (const [k, v] of Object.entries(security.deviceSeasonCounts)) {
       const n = Number(v);
-      if (Number.isInteger(n) && n > 0) deviceSeasonCounts[k] = n;
+      if (!Number.isInteger(n) || n <= 0) continue;
+      const m = String(k).match(/^(\d{4}-\d{2})::/);
+      if (m && seasonToIndex(m[1]) < minDevSeasonIdx) continue;
+      deviceSeasonCounts[k] = n;
     }
   }
 
-  // 自己修正（pending の解消など）用のスロットル情報
+  const deviceSeasonConsumed = {};
+  if (security.deviceSeasonConsumed && typeof security.deviceSeasonConsumed === "object") {
+    for (const [k, v] of Object.entries(security.deviceSeasonConsumed)) {
+      if (!v) continue;
+      const m = String(k).match(/^(\d{4}-\d{2})::/);
+      if (m && seasonToIndex(m[1]) < minDevSeasonIdx) continue;
+      deviceSeasonConsumed[k] = true;
+    }
+  }
+
   const autoFix = security.autoFix && typeof security.autoFix === "object"
     ? security.autoFix
     : null;
@@ -8064,9 +8475,26 @@ function normalizeSecurityState(security) {
       if (Number.isFinite(n) && n > 0) lastErrorBySymbol[sym] = n;
     }
   }
+  const trimSymbolThrottleMap = (map, maxKeys) => {
+    const keys = Object.keys(map);
+    if (keys.length <= maxKeys) return;
+    keys.sort((a, b) => (map[a] || 0) - (map[b] || 0));
+    for (let i = 0; i < keys.length - maxKeys; i += 1) delete map[keys[i]];
+  };
+  trimSymbolThrottleMap(lastBySymbol, 100);
+  trimSymbolThrottleMap(lastErrorBySymbol, 100);
+
   const lastRunAt = Number.isFinite(Number(autoFix?.lastRunAt)) ? Number(autoFix.lastRunAt) : 0;
 
-  return { failed, lockUntil, lockCount, registrationTimestamps, deviceSeasonCounts, autoFix: { lastRunAt, lastBySymbol, lastErrorBySymbol } };
+  return {
+    failed,
+    lockUntil,
+    lockCount,
+    registrationTimestamps,
+    deviceSeasonCounts,
+    deviceSeasonConsumed,
+    autoFix: { lastRunAt, lastBySymbol, lastErrorBySymbol }
+  };
 }
 
 function normalizeSettingsState(settings) {
@@ -8168,15 +8596,36 @@ function showGlobalNotice(message, isError) {
   });
 }
 
+function setAccountChangeDoneMessage(el, text) {
+  const key = el.id || "msg-" + (el.className || "");
+  const t = String(text || "").trim();
+  if (!t) {
+    setMessage(el, "", false);
+    return;
+  }
+  el.textContent = t;
+  el.classList.remove("error", "success");
+  el.classList.add("account-settings-done");
+  scheduleMessageAutoClear(key, () => {
+    el.textContent = "";
+    el.classList.remove("account-settings-done");
+  });
+}
+
 function setMessage(el, text, isError) {
   const key = el.id || "msg-" + (el.className || "");
   el.textContent = text || "";
-  el.classList.remove("error", "success");
-  if (!text) return;
+  el.classList.remove("error", "success", "account-settings-done");
+  if (!text) {
+    const pending = app.messageAutoClearTimers.get(key);
+    if (pending) clearTimeout(pending);
+    app.messageAutoClearTimers.delete(key);
+    return;
+  }
   el.classList.add(isError ? "error" : "success");
   scheduleMessageAutoClear(key, () => {
     el.textContent = "";
-    el.classList.remove("error", "success");
+    el.classList.remove("error", "success", "account-settings-done");
   });
 }
 

@@ -1,4 +1,4 @@
-/* Webフォントは stockgame.html の link で読込（@import だと初回描画でフォントが揺れやすい） */
+/* Webフォントは index.html の link で読込（@import だと初回描画でフォントが揺れやすい） */
 
 :root {
   /* 英字専用フォント（Arial/Helvetica/Montserrat 等）は混植でベースラインがズレやすいため使わない */
@@ -802,6 +802,17 @@ small {
   display: none;
 }
 
+/* マイページ: アカウント設定〜ログアウト〜削除の行間を同一（0.5rem）に */
+#accountPanel .account-setting-buttons {
+  margin-bottom: 0;
+}
+#accountPanel #accountMessage.inline-message:not(:empty) {
+  margin-top: 0.5rem;
+}
+#accountPanel #accountMessage ~ .button-row {
+  margin-top: 0.5rem;
+}
+
 /* マイページ 今月のリターン（バトル重要指標） */
 .monthly-result-label {
   margin: 0 0 4px;
@@ -1273,6 +1284,14 @@ tbody tr:hover {
 }
 
 .col-menu { width: auto; white-space: normal; text-align: center; vertical-align: middle; }
+/* 未ログイン時は操作列（詳細・通報・⋮）を非表示 */
+#liveRankTable:not(.rank-menu-visible) th.col-menu,
+#liveRankTable:not(.rank-menu-visible) td.col-menu,
+#historyTable:not(.rank-menu-visible) th.col-menu,
+#historyTable:not(.rank-menu-visible) td.col-menu {
+  display: none !important;
+}
+
 .rank-menu-wrap { position: relative; display: inline-flex; align-items: center; flex-wrap: wrap; gap: 6px; justify-content: flex-end; max-width: 100%; }
 .rank-menu-detail-btn {
   font-size: 0.78rem;
@@ -1713,12 +1732,22 @@ tbody tr:hover {
   font-size: 0.86rem;
 }
 
+.inline-message:empty {
+  display: none;
+  margin-top: 0;
+  min-height: 0;
+}
+
 .inline-message.error {
   color: #9f2038;
 }
 
 .inline-message.success {
   color: #16613d;
+}
+
+.inline-message.account-settings-done {
+  color: #b71c1c;
 }
 
 .rule-list {

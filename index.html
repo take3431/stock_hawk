@@ -5,8 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
   <meta name="referrer" content="strict-origin-when-cross-origin" />
   <meta http-equiv="X-Content-Type-Options" content="nosniff" />
-  <link rel="icon" href="./stockhawkpaint.png" type="image/png" />
-  <link rel="apple-touch-icon" href="./stockhawkpaint.png" />
+  <!-- ファビコン: リポジトリルート（GitHub Pages のサイト直下）に favicon.png / apple-touch-icon.png を置いた場合のパス。
+       サブディレクトリ公開（例: /stockgame/）なら href を /stockgame/favicon.png に変更してください。 -->
+  <link rel="icon" href="/favicon.png" type="image/png" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
   <!-- 初期は相対。読み込み直後に現在の絶対URLへ（クローラーがJS実行する場合に有効） -->
   <link rel="canonical" id="seo-canonical" href="index.html" />
   <meta property="og:url" id="seo-og-url" content="" />
@@ -50,7 +52,7 @@
     content="毎月の株価上昇率で順位を競う無料のブラウザゲーム。日本株・米国株・仮想通貨から銘柄を選び、月次ランキングとアカウント同期に対応。"
   />
   <meta name="twitter:card" content="summary" />
-  <meta name="twitter:title" content="株のタカ｜月次株価ランキング・株ゲーム" />
+  <meta name="twitter:title" content="株のタカ" />
   <meta
     name="twitter:description"
     content="毎月の株価上昇率で競う無料の株ゲーム。日本株・米国株・仮想通貨対応。"
@@ -61,7 +63,9 @@
     "@graph": [
       {
         "@type": "WebSite",
+        "@id": "https://take3431.github.io/#website",
         "name": "株のタカ",
+        "url": "https://take3431.github.io/",
         "inLanguage": "ja-JP",
         "description": "毎月の株価上昇率で順位を競う無料のブラウザ株ゲーム。日本株・米国株・仮想通貨の銘柄選択と月次ランキング。アカウント登録で端末間同期に対応。"
       },
@@ -88,7 +92,7 @@
             "name": "株のタカは無料ですか？",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "ブラウザ上で無料で遊べる株価シミュレーション・月次ランキングゲームです。投資の勧誘や助言ではありません。"
+              "text": "ブラウザ上で無料で遊べる株価シミュレーション・ランキングゲームです。投資の勧誘や助言ではありません。"
             }
           },
           {
@@ -96,7 +100,7 @@
             "name": "どの市場の銘柄を選べますか？",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "日本株・米国株・仮想通貨から、最大5銘柄まで保有して月次の株価上昇率で順位を競えます。最低1銘柄から参加できます。"
+              "text": "日本株・米国株・仮想通貨から、最大5銘柄まで保有して毎月の株価上昇率で順位を競えます。最低1銘柄から参加できます。"
             }
           },
           {
@@ -120,7 +124,7 @@
     href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap"
     rel="stylesheet"
   />
-  <link rel="stylesheet" href="./stockgame.css?v=92" />
+  <link rel="stylesheet" href="./stockgame.css?v=97" />
 </head>
 <body>
   <noscript>
@@ -206,7 +210,10 @@
                 </ul>
               </li>
               <li><strong>結果の確定</strong>: 月が変わるとその月の結果が確定し、ランキングと履歴に残ります</li>
-              <li><strong>月ごとの運用</strong>: 月ごとに株価上昇率で順位を競います。<br class="rule-br-mobile" />その月に参加するときは、その月用に新しくアカウントを作成してください</li>
+              <li class="rule-li-monthly-ops">
+                <span class="rule-monthly-ops-line1"><strong>月ごとの運用</strong>: 月ごとに株価上昇率で順位を競います。</span>
+                <span class="rule-monthly-ops-line2">その月に参加するときは、その月用に新しくアカウントを作成してください</span>
+              </li>
               <li><strong>注意</strong>: 先月以前に作成したアカウントは、今月の参加に使えません。<br class="rule-br-mobile" />参加するときは作り直してください。</li>
             </ul>
           </div>
@@ -563,7 +570,10 @@
               </ul>
             </li>
             <li><strong>結果の確定</strong>: 月が変わるとその月の結果が確定し、ランキングと履歴に残ります</li>
-            <li><strong>月ごとの運用</strong>: 月ごとに株価上昇率で順位を競います。<br class="rule-br-mobile" />その月に参加するときは、その月用に新しくアカウントを作成してください</li>
+            <li class="rule-li-monthly-ops">
+              <span class="rule-monthly-ops-line1"><strong>月ごとの運用</strong>: 月ごとに株価上昇率で順位を競います。</span>
+              <span class="rule-monthly-ops-line2">その月に参加するときは、その月用に新しくアカウントを作成してください</span>
+            </li>
             <li><strong>注意</strong>: 先月以前に作成したアカウントは、今月の参加に使えません。<br class="rule-br-mobile" />参加するときは作り直してください。</li>
           </ul>
         </div>
@@ -599,6 +609,6 @@
     };
   </script>
   <script src="./jp_company_autocomplete_engine.js"></script>
-  <script src="./stockgame.js?v=103" defer></script>
+  <script src="./stockgame.js?v=104" defer></script>
 </body>
 </html>

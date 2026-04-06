@@ -5488,14 +5488,14 @@ function hideSymbolSuggestions() {
 
 function renderTradeDetails(trades) {
   const safeTrades = Array.isArray(trades) ? trades : [];
-  return renderTradeDetailsBlock(`取引内容 (${safeTrades.length})`, safeTrades);
+  return renderTradeDetailsBlock(safeTrades);
 }
 
-function renderTradeDetailsBlock(label, trades) {
-  const safeTrades = Array.isArray(trades) ? trades : [];
+function renderTradeDetailsBlock(safeTrades) {
   if (!safeTrades.length) {
     return `<span class="rank-note">履歴なし</span>`;
   }
+  const n = safeTrades.length;
   const listItems = safeTrades.map((t) => {
     const name = getSymbolDisplayName(t.symbol);
     const entryStr = t.entryPrice != null ? formatPrice(t.entryPrice, t.market) : "-";
@@ -5505,7 +5505,7 @@ function renderTradeDetailsBlock(label, trades) {
   }).join("");
   return `
     <details class="rank-trade-details">
-      <summary class="rank-trade-summary">${escapeHtml(label)} — 「詳細」で確認・PDF保存（PCは行の右クリックでも可）</summary>
+      <summary class="rank-trade-summary"><span class="rank-trade-summary__label">取引内容</span><span class="rank-trade-summary__count">（${n}）</span><span class="rank-trade-summary__hint"> — 「詳細」で確認・PDF保存（PCは行の右クリックでも可）</span></summary>
       <ul class="rank-trade-inline-list">${listItems}</ul>
     </details>
   `;

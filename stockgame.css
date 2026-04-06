@@ -250,6 +250,9 @@ input[type="password"]::-ms-clear {
   display: grid;
   gap: 8px;
   line-height: 1.7;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 .layout-grid.with-left #ruleCard {
@@ -283,12 +286,17 @@ input[type="password"]::-ms-clear {
   font-size: clamp(0.86rem, 0.55vw + 0.78rem, 1.05rem);
   line-height: 1.6;
   font-weight: 600;
-  max-width: 40rem;
+  max-width: min(40rem, 100%);
+  box-sizing: border-box;
+  overflow-wrap: break-word;
+  word-break: keep-all;
 }
 
 #ruleCard .rule-body .rule-lead.rule-lead--flow {
   font-size: clamp(0.84rem, 0.5vw + 0.74rem, 1.02rem);
   line-height: 1.52;
+  max-width: 100%;
+  box-sizing: border-box;
 }
 
 /* ルール本文: 狭い画面だけ意図した位置で改行 */
@@ -302,19 +310,36 @@ br.rule-br-mobile {
   }
 }
 
-/* 月ごとの運用: 1行目の直後で改行。2行目は途中改行なし（幅に応じて文字サイズを縮小） */
+/* 月ごとの運用: 1行目の直後で改行。文字サイズは下の li.rule-li-monthly-ops の1箇所のみ変更（両行・強調も同じサイズ） */
+.rule-li-monthly-ops {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.rule-body .rule-list > li.rule-li-monthly-ops,
+.register-rules-body .rule-list > li.rule-li-monthly-ops {
+  font-size: clamp(0.66rem, 0.16rem + 2.75vw, 0.95rem);
+  line-height: 1.56;
+}
+
 .rule-li-monthly-ops .rule-monthly-ops-line1 {
   display: block;
   margin-bottom: 0.42em;
-  line-height: 1.5;
-  font-size: 1em;
+  line-height: inherit;
+  max-width: 100%;
+  font-size: inherit;
+  overflow-wrap: break-word;
+  word-break: keep-all;
 }
 
 .rule-li-monthly-ops .rule-monthly-ops-line2 {
   display: block;
-  white-space: nowrap;
-  font-size: clamp(0.52rem, 0.26rem + 2.65vw, 0.92rem);
-  line-height: 1.58;
+  max-width: 100%;
+  white-space: normal;
+  font-size: inherit;
+  line-height: inherit;
+  overflow-wrap: break-word;
+  word-break: keep-all;
 }
 
 /* 約定タイミングの内側リスト: 狭い画面では文字を詰めて1行に近づける */
@@ -330,6 +355,20 @@ br.rule-br-mobile {
 .register-rules-body .rule-list {
   margin: 0;
   padding-left: 1.15rem;
+  min-width: 0;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+/* 長文が右にはみ出さないよう、1段目の項目のみ幅と折り返し・可変フォントを指定 */
+.rule-body .rule-list > li,
+.register-rules-body .rule-list > li {
+  min-width: 0;
+  max-width: 100%;
+  font-size: clamp(0.7rem, 0.22rem + 2.55vw, 1.02rem);
+  line-height: 1.58;
+  overflow-wrap: break-word;
+  word-break: keep-all;
 }
 
 .rule-body .rule-list li,
@@ -634,20 +673,28 @@ small {
 #authForm .auth-form-secondary-row {
   display: flex;
   flex-direction: row;
-  flex-wrap: nowrap;
+  flex-wrap: wrap;
   align-items: stretch;
   gap: 8px;
   margin-top: 1rem;
 }
 
 #authForm .auth-form-secondary-row .btn {
-  flex: 1 1 0;
-  min-width: 0;
+  flex: 1 1 auto;
+  min-width: max-content;
   min-height: 46px;
   padding: 8px 10px;
   font-size: clamp(0.78rem, 1.8vw + 0.55rem, 0.92rem);
   font-weight: 650;
   line-height: 1.2;
+  white-space: nowrap;
+}
+
+@media (max-width: 420px) {
+  #authForm .auth-form-secondary-row .btn {
+    flex: 1 1 100%;
+    justify-content: center;
+  }
 }
 
 .btn {
@@ -1399,12 +1446,14 @@ tbody tr:hover {
   text-align: center;
 }
 
-/* アカウント名（ID は最大8文字・2〜6文字は大きく、7〜8は枠に合わせてやや小さく） */
+/* アカウント名（見出しは折り返さない。本文セルは .rank-account-cell で折り返し） */
 #liveRankTable th:nth-child(2),
 #historyTable th:nth-child(2) {
   width: 13%;
-  min-width: 0;
-  white-space: normal;
+  min-width: 5.75rem;
+  white-space: nowrap;
+  word-break: keep-all;
+  overflow-wrap: normal;
   overflow: visible;
   text-overflow: clip;
   vertical-align: middle;
@@ -1446,33 +1495,35 @@ tbody tr:hover {
   letter-spacing: -0.015em;
 }
 
-/* 上昇率：セル内で左右・上下中央 */
+/* 上昇率：セル内で左右・上下中央（大きな数値・% でも隣列と重ならないよう最小幅を確保） */
 #liveRankTable th:nth-child(3),
 #liveRankTable td:nth-child(3),
 #historyTable th:nth-child(3),
 #historyTable td:nth-child(3) {
   width: 8%;
+  min-width: 5.65rem;
   white-space: nowrap;
   vertical-align: middle;
   text-align: center;
+  box-sizing: border-box;
 }
 
 /* 上昇率列と保有銘柄列のあいだを空け、数値と銘柄文が詰まって見えないようにする */
 #liveRankTable thead th:nth-child(3),
 #historyTable thead th:nth-child(3) {
-  padding-right: 14px;
+  padding-right: 20px;
 }
 #liveRankTable thead th:nth-child(4),
 #historyTable thead th:nth-child(4) {
-  padding-left: 12px;
+  padding-left: 16px;
 }
 #liveRankTable tbody tr.rank-row td:nth-child(3),
 #historyTable tbody tr.rank-row td:nth-child(3) {
-  padding-right: 14px;
+  padding-right: 20px;
 }
 #liveRankTable tbody tr.rank-row td:nth-child(4),
 #historyTable tbody tr.rank-row td:nth-child(4) {
-  padding-left: 12px;
+  padding-left: 16px;
 }
 
 .rank-holding-pending-label {
@@ -2943,7 +2994,7 @@ tbody tr:hover {
     display: table;
     width: 100%;
     max-width: 100%;
-    min-width: min(760px, max(100%, 32rem));
+    min-width: min(760px, max(100%, 36rem));
     table-layout: fixed;
     border-collapse: separate;
     border-spacing: 0;
@@ -2993,7 +3044,10 @@ tbody tr:hover {
 
   #liveRankTable thead th:nth-child(2),
   #historyTable thead th:nth-child(2) {
-    min-width: 5.35rem;
+    min-width: 6.85rem;
+    white-space: nowrap;
+    word-break: keep-all;
+    overflow-wrap: normal;
   }
 
   #liveRankTable thead th:nth-child(2),
@@ -3019,8 +3073,8 @@ tbody tr:hover {
   #liveRankTable td:nth-child(2),
   #historyTable th:nth-child(2),
   #historyTable td:nth-child(2) {
-    width: 19%;
-    min-width: 5.35rem;
+    width: 18%;
+    min-width: 6.85rem;
     max-width: none;
   }
 
@@ -3028,35 +3082,36 @@ tbody tr:hover {
   #liveRankTable td:nth-child(3),
   #historyTable th:nth-child(3),
   #historyTable td:nth-child(3) {
-    width: 11%;
-    min-width: 3.65rem;
+    width: 13%;
+    min-width: 6.25rem;
     max-width: none;
+    box-sizing: border-box;
   }
 
   #liveRankTable th:nth-child(4),
   #liveRankTable td:nth-child(4),
   #historyTable th:nth-child(4),
   #historyTable td:nth-child(4) {
-    width: 33%;
+    width: 31%;
     min-width: 0;
     max-width: none;
   }
 
   #liveRankTable thead th:nth-child(3),
   #historyTable thead th:nth-child(3) {
-    padding-right: clamp(12px, 3.2vw, 18px);
+    padding-right: clamp(14px, 4vw, 22px);
   }
 
   #liveRankTable thead th:nth-child(4),
   #historyTable thead th:nth-child(4) {
-    padding-left: clamp(12px, 3.2vw, 18px);
+    padding-left: clamp(14px, 4vw, 22px);
   }
 
   #liveRankTable th:nth-child(5),
   #liveRankTable td:nth-child(5),
   #historyTable th:nth-child(5),
   #historyTable td:nth-child(5) {
-    width: 21%;
+    width: 20%;
     min-width: 0;
     max-width: none;
   }
@@ -3065,7 +3120,7 @@ tbody tr:hover {
   #liveRankTable td:nth-child(6),
   #historyTable th:nth-child(6),
   #historyTable td:nth-child(6) {
-    width: 7%;
+    width: 9%;
     min-width: 2.85rem;
     max-width: none;
     padding-left: 4px;
@@ -3121,12 +3176,12 @@ tbody tr:hover {
     white-space: nowrap;
     word-break: normal;
     overflow-wrap: normal;
-    padding-right: clamp(12px, 3.5vw, 18px);
+    padding-right: clamp(14px, 4vw, 22px);
   }
 
   #liveRankTable tbody tr.rank-row td:nth-child(4),
   #historyTable tbody tr.rank-row td:nth-child(4) {
-    padding-left: clamp(12px, 3.5vw, 18px);
+    padding-left: clamp(14px, 4vw, 22px);
   }
 
   #liveRankTable tbody tr.rank-row td:nth-child(3) .rank-pct-cell__inner,

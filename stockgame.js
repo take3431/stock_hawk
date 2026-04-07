@@ -2346,7 +2346,25 @@ async function maybeAutoFixPendingPicks() {
 async function runDailyRankingRefresh() {
   try {
     await rollSeasonIfNeeded();
-    await refreshAllUsersLatest(true);
+    // 0:00/12:00 更新は「マイページ(自分)＋ランキング表示」用途。
+    // Yahoo への負荷を抑えるため、まずはキャッシュのみで全員分を再計算し、
+    // 取得が必要な分だけ（基本は自分のみ）更新する。
+    try {
+      refreshUsersLatestCacheOnly(getActiveUsers());
+    } catch (_) {}
+
+    // Supabase 利用時は他参加者のランキングはサーバー集計を取り込む（Yahoo へは行かない）
+    if (getSupabaseCloudConfig()) {
+      try {
+        await pullPublicRankingSnapshot("scheduled");
+      } catch (_) {}
+    }
+
+    // 自分の保有銘柄の上昇率は 0:00/12:00 で更新したい（必要最小限の外部取得）
+    // ※これが Yahoo を叩く可能性はあるが、全ユーザーではなく「自分のみ」に限定する。
+    try {
+      await refreshCurrentUserLatest(true);
+    } catch (_) {}
     app.state.lastRankUpdateAt = new Date().toISOString();
     app.state.lastDailyRefreshDate = getDateKeyJst(new Date());
     saveState();
@@ -2358,7 +2376,7 @@ async function runDailyRankingRefresh() {
       renderAll();
     } catch (_) {}
     if (typeof showGlobalNotice === "function") {
-      showGlobalNotice("12時の自動更新で一時的に取得に失敗しました。「最新の順位を見る」で再取得できます。", true);
+      showGlobalNotice("0時/12時の自動更新で一時的に取得に失敗しました。「最新の順位を見る」で再取得できます。", true);
     }
   }
 }
@@ -2564,6 +2582,21 @@ function wireEvents() {
   app.els.historyTableBody.addEventListener("click", onLiveRankBodyClick);
   app.els.liveRankBody.addEventListener("contextmenu", onRankRowContextMenu);
   app.els.historyTableBody.addEventListener("contextmenu", onRankRowContextMenu);
+
+  // 「取引内容(details)」の開閉に合わせて、表全体を横スクロールしやすい幅へ切り替える
+  // toggle は details の open 状態確定後に発火するので、クリックより確実。
+  const onTradeDetailsToggle = (e) => {
+    const t = e.target;
+    if (!(t instanceof HTMLElement)) return;
+    if (t.tagName !== "DETAILS" || !t.classList.contains("rank-trade-details")) return;
+    const table = t.closest("table");
+    if (!table) return;
+    const anyOpen = Boolean(table.querySelector("details.rank-trade-details[open]"));
+    table.classList.toggle("rank-table--trade-expanded", anyOpen);
+  };
+  app.els.liveRankBody.addEventListener("toggle", onTradeDetailsToggle, true);
+  app.els.historyTableBody.addEventListener("toggle", onTradeDetailsToggle, true);
+
   app.els.historyMonthSelect.addEventListener("change", renderHistoryTable);
   document.addEventListener("click", onDocumentClick);
   window.addEventListener("beforeunload", (e) => {
@@ -3102,7 +3135,8 @@ function renderPickTable() {
         : `<span class="price-line-primary">-</span>`;
     const canSell = !pick.entryPending && pick.status !== "CLOSED";
     // 売却予約中は削除不可（取消は「売却取消」のみ。未約定買いのみ削除可）
-    const canRemove = pick.entryPending;
+    // 「約定しているのに entryPending が残る」などの矛盾があっても削除できないようにする
+    const canRemove = Boolean(pick.entryPending && pick.entryPrice == null && !pick.sellPending && pick.status !== "CLOSED");
     const pickIdSafe = escapeHtml(pick.id);
     const sellBtn = pick.sellPending
       ? `<button class="tiny-btn" data-action="cancelSell" data-pick-id="${pickIdSafe}" type="button">売却取消</button>`
@@ -3726,6 +3760,13 @@ async function onRegisterConfirmOk() {
     await guardedSubmit("auth", async () => {
       await rollSeasonIfNeeded();
       await registerAccount(p.name, p.password, p.recoveryQuestionId, p.recoveryAnswer);
+      // 登録直後は server の state が「自分の分」中心で返ることがあるため、
+      // 公開ランキングスナップショットを即取り込み、他参加者の順位もすぐ表示できるようにする。
+      if (getSupabaseCloudConfig()) {
+        try {
+          await pullPublicRankingSnapshot("boot");
+        } catch (_) {}
+      }
     });
     app.pendingRegistration = null;
     setMessage(app.els.authMessage, "アカウントを作成しました。", false);
@@ -5190,6 +5231,18 @@ function onDocumentClick(event) {
   if (!target.closest(".rank-menu-wrap")) {
     closeAllRankMenuPanels();
   }
+
+  // 「取引内容」を開いた/閉じた時にテーブル全体の横スクロールへ切り替える
+  const details = target.closest("details.rank-trade-details");
+  if (details) {
+    // details の open 反映後に判定したいのでマイクロタスクで遅延
+    queueMicrotask(() => {
+      const table = details.closest("table");
+      if (!table) return;
+      const anyOpen = Boolean(table.querySelector("details.rank-trade-details[open]"));
+      table.classList.toggle("rank-table--trade-expanded", anyOpen);
+    });
+  }
 }
 
 async function loadJpCompanyMaster() {
@@ -5501,7 +5554,12 @@ function renderTradeDetailsBlock(safeTrades) {
     const entryStr = t.entryPrice != null ? formatPrice(t.entryPrice, t.market) : "-";
     const exitStr = t.exitPrice != null ? formatPrice(t.exitPrice, t.market) : (t.exitDate && t.exitDate !== "-" ? t.exitDate : "保有");
     const pctClass = t.returnPct > 0 ? "pct-up" : t.returnPct < 0 ? "pct-down" : "pct-flat";
-    return `<li class="rank-trade-inline-item"><span class="rank-trade-name">${escapeHtml(name)}</span> 購入: ${escapeHtml(entryStr)} 現在/売却: ${escapeHtml(exitStr)} <span class="${pctClass}">${formatPct(t.returnPct)}</span></li>`;
+    return `<li class="rank-trade-inline-item">
+      <span class="rank-trade-line rank-trade-line--name"><span class="rank-trade-name">${escapeHtml(name)}</span></span>
+      <span class="rank-trade-line rank-trade-line--kv">購入：${escapeHtml(entryStr)}</span>
+      <span class="rank-trade-line rank-trade-line--kv">現在/売却：${escapeHtml(exitStr)}</span>
+      <span class="rank-trade-line rank-trade-line--pct ${pctClass}">${escapeHtml(formatPct(t.returnPct))}</span>
+    </li>`;
   }).join("");
   return `
     <details class="rank-trade-details">

@@ -1341,7 +1341,9 @@ tbody tr:hover {
 #liveRankTable,
 #historyTable {
   table-layout: fixed;
-  min-width: 0;
+  /* テーブルが細く潰れると「アカウント名」と「上昇率」が重なって見えるため、
+     最低幅を確保し、狭い場合は table-wrap 側で横スクロールさせる */
+  min-width: 760px;
   max-width: 100%;
   width: 100%;
 }
@@ -1349,7 +1351,7 @@ tbody tr:hover {
 /* 横スクロールは table 幅内に収める。hidden だと最終列（メニュー）が切れることがあるため使わない */
 #liveRankCard .table-wrap,
 #historyCard .table-wrap {
-  overflow-x: visible;
+  overflow-x: auto;
   max-width: 100%;
 }
 
@@ -1926,11 +1928,97 @@ tbody tr:hover {
   margin: 4px 0 0 0;
   padding-left: 1rem;
   list-style: disc;
+  /* 取引内容内だけが横スクロールになるのを防ぐ（横スクロールは表全体で行う） */
+  overflow-x: visible !important;
 }
 .rank-trade-inline-item {
   margin: 2px 0;
   line-height: 1.4;
 }
+
+/* ランキング「取引内容」: 見やすい段落区切り（名前→購入→現在/売却→損益%） */
+.rank-trade-inline-item {
+  list-style-position: outside;
+}
+.rank-trade-inline-item .rank-trade-line {
+  display: block;
+  max-width: 100%;
+  overflow-wrap: break-word;
+  word-break: keep-all;
+  line-height: 1.45;
+}
+.rank-trade-inline-item .rank-trade-line--kv {
+  /* 「購入：$176.70」のようにラベルと値は分断しない。入り切らない場合は横スクロールで読む */
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: normal;
+}
+.rank-trade-inline-item .rank-trade-line--pct {
+  white-space: nowrap;
+  overflow-wrap: normal;
+  word-break: normal;
+  font-variant-numeric: tabular-nums;
+}
+.rank-trade-inline-item .rank-trade-line--name {
+  margin-bottom: 0.1em;
+}
+.rank-trade-inline-item .rank-trade-line:last-child {
+  margin-top: 0.08em;
+  font-weight: 700;
+}
+
+/* 取引内容を開いたときは「表全体」を横スクロールさせる（内容部分だけの横スクロールはしない） */
+.rank-trade-details[open] .rank-trade-inline-list {
+  overflow: visible;
+  padding-bottom: 0;
+}
+.rank-trade-details[open] .rank-trade-inline-item {
+  min-width: 0;
+}
+
+/* 取引内容を開いた時だけ、取引内容列を広げて見やすくする */
+#liveRankTable.rank-table--trade-expanded,
+#historyTable.rank-table--trade-expanded {
+  /* 取引内容列は「最長行の右端＝必要最小幅」にしたいので auto で内容に合わせる。
+     ただし表が縮みすぎないよう min-width で親幅を下回らせない。 */
+  table-layout: auto;
+  width: max-content;
+  min-width: max(100%, 760px);
+}
+#liveRankTable.rank-table--trade-expanded td.rank-trade-col,
+#historyTable.rank-table--trade-expanded td.rank-trade-col {
+  /* 取引内容列は内容（nowrap行）の最大幅に合わせる */
+  min-width: 0;
+  width: auto;
+}
+
+/* 展開時も「取引内容以外」は通常時の幅感を維持（潰れ・圧縮を防止） */
+#liveRankTable.rank-table--trade-expanded th:nth-child(1),
+#liveRankTable.rank-table--trade-expanded td:nth-child(1),
+#historyTable.rank-table--trade-expanded th:nth-child(1),
+#historyTable.rank-table--trade-expanded td:nth-child(1) { width: 9%; min-width: 3.35rem; }
+
+#liveRankTable.rank-table--trade-expanded th:nth-child(2),
+#liveRankTable.rank-table--trade-expanded td:nth-child(2),
+#historyTable.rank-table--trade-expanded th:nth-child(2),
+#historyTable.rank-table--trade-expanded td:nth-child(2) { width: 18%; min-width: 6.85rem; }
+
+#liveRankTable.rank-table--trade-expanded th:nth-child(3),
+#liveRankTable.rank-table--trade-expanded td:nth-child(3),
+#historyTable.rank-table--trade-expanded th:nth-child(3),
+#historyTable.rank-table--trade-expanded td:nth-child(3) { width: 13%; min-width: 6.25rem; }
+
+#liveRankTable.rank-table--trade-expanded th:nth-child(4),
+#liveRankTable.rank-table--trade-expanded td:nth-child(4),
+#historyTable.rank-table--trade-expanded th:nth-child(4),
+#historyTable.rank-table--trade-expanded td:nth-child(4) { width: 31%; min-width: 12rem; }
+
+/* 取引内容列(5)は auto（内容に合わせる） */
+
+#liveRankTable.rank-table--trade-expanded th:nth-child(6),
+#liveRankTable.rank-table--trade-expanded td:nth-child(6),
+#historyTable.rank-table--trade-expanded th:nth-child(6),
+#historyTable.rank-table--trade-expanded td:nth-child(6) { width: 9%; min-width: 4.75rem; }
 
 /* 価格・状態・ランキング注記: 改行表示用（… で切らない） */
 .price-line-primary {
@@ -3226,6 +3314,10 @@ tbody tr:hover {
     margin: 3px 0;
   }
 
+  .rank-trade-inline-item .rank-trade-line {
+    line-height: 1.35;
+  }
+
   #rankReportModal .rank-report-dialog {
     width: min(100%, 96vw);
     padding: 0.75rem 0.65rem;
@@ -3309,6 +3401,7 @@ tbody tr:hover {
     line-height: 1.42;
     max-height: 10rem;
     overflow-y: auto;
+    overflow-x: hidden; /* セル単体で横スクロールさせない */
     -webkit-overflow-scrolling: touch;
   }
 

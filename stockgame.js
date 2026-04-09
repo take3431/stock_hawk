@@ -2591,6 +2591,27 @@ function wireEvents() {
 
   // 「取引内容(details)」の開閉に合わせて、表全体を横スクロールしやすい幅へ切り替える
   // toggle は details の open 状態確定後に発火するので、クリックより確実。
+  const scrollRankTableWrapToShowTradeCell = (wrap, td) => {
+    if (!(wrap instanceof HTMLElement) || !(td instanceof HTMLElement)) return;
+    const pad = 12;
+    const c = wrap.getBoundingClientRect();
+    const e = td.getBoundingClientRect();
+    let next = wrap.scrollLeft;
+    if (e.left < c.left + pad) {
+      next -= c.left + pad - e.left;
+    }
+    if (e.right > c.right - pad) {
+      next += e.right - (c.right - pad);
+    }
+    const maxSl = Math.max(0, wrap.scrollWidth - wrap.clientWidth);
+    next = Math.max(0, Math.min(maxSl, next));
+    try {
+      wrap.scrollTo({ left: next, behavior: "smooth" });
+    } catch (_) {
+      wrap.scrollLeft = next;
+    }
+  };
+
   const onTradeDetailsToggle = (e) => {
     const t = e.target;
     if (!(t instanceof HTMLElement)) return;
@@ -2599,6 +2620,18 @@ function wireEvents() {
     if (!table) return;
     const anyOpen = Boolean(table.querySelector("details.rank-trade-details[open]"));
     table.classList.toggle("rank-table--trade-expanded", anyOpen);
+
+    // 縦スクロールは動かさず、.table-wrap だけ横方向で取引列が見えるようにする
+    if (t instanceof HTMLDetailsElement && t.open) {
+      const runAfterLayout = () => {
+        const td = t.closest("td.rank-trade-col");
+        const wrap = table.closest(".table-wrap");
+        if (td && wrap) scrollRankTableWrapToShowTradeCell(wrap, td);
+      };
+      requestAnimationFrame(() => {
+        requestAnimationFrame(runAfterLayout);
+      });
+    }
   };
   app.els.liveRankBody.addEventListener("toggle", onTradeDetailsToggle, true);
   app.els.historyTableBody.addEventListener("toggle", onTradeDetailsToggle, true);
@@ -3461,7 +3494,7 @@ function renderLiveRanking() {
     const accountLenClass = rankAccountCellLenClass(row.displayName);
     tr.innerHTML = `
       <td class="rank-td" data-label="順位"><span class="rank-no">${rankBadge}<span class="rank-num">${displayRank ? displayRank : "-"}</span></span></td>
-      <td class="rank-account-cell ${accountLenClass}${row.isAnonymized ? " rank-account-cell--anon" : ""}" data-label="アカウント名"><span class="rank-account-cell__inner">${accountHtml}</span></td>
+      <td class="rank-account-cell ${accountLenClass}${row.isAnonymized ? " rank-account-cell--anon" : ""}" data-label="名前"><span class="rank-account-cell__inner">${accountHtml}</span></td>
       <td class="${pctClass}" data-label="上昇率"><span class="rank-pct-cell__inner">${pctText}</span></td>
       <td class="rank-symbols-cell" data-label="保有銘柄">${row.symbolsHtml != null ? row.symbolsHtml : escapeHtml(row.symbolsText || "-")}</td>
       <td class="rank-trade-col" data-label="取引内容">${tradesCell}</td>
@@ -3563,7 +3596,7 @@ function renderHistoryTable() {
     const accountLenClass = rankAccountCellLenClass(histName);
     tr.innerHTML = `
       <td class="rank-td" data-label="順位"><span class="rank-no">${rankBadge}<span class="rank-num">${rank}</span></span></td>
-      <td class="rank-account-cell ${accountLenClass}${row.isAnonymized ? " rank-account-cell--anon" : ""}" data-label="アカウント名"><span class="rank-account-cell__inner">${accountHtml}</span></td>
+      <td class="rank-account-cell ${accountLenClass}${row.isAnonymized ? " rank-account-cell--anon" : ""}" data-label="名前"><span class="rank-account-cell__inner">${accountHtml}</span></td>
       <td class="${pctClass}" data-label="上昇率"><span class="rank-pct-cell__inner">${formatPct(row.returnPct)}</span></td>
       <td class="rank-symbols-cell" data-label="保有銘柄">${historySymbolsHtml}</td>
       <td class="rank-trade-col" data-label="取引内容">${renderTradeDetails(row.trades || [])}</td>

@@ -491,7 +491,10 @@
           <h2 class="rank-live-title">今月ランキング</h2>
           <p class="section-note">終値更新時点の暫定順位です。月末に確定します。</p>
           <div class="rank-refresh-toolbar">
-            <button id="refreshRankBtn" class="btn btn-secondary rank-refresh-btn" type="button">最新の順位を見る</button>
+            <div class="rank-refresh-row">
+              <button id="refreshRankBtn" class="btn btn-secondary rank-refresh-btn" type="button">最新の順位を見る</button>
+              <span id="rankRefreshProgress" class="rank-refresh-progress" aria-live="polite"></span>
+            </div>
             <span id="rankLastUpdateLabel" class="section-note rank-last-update-label"></span>
           </div>
           <div class="table-wrap">
@@ -591,7 +594,7 @@
      * Supabase（株のタカクラウド）: service_role（秘密キー）は絶対に書かないこと。Firebase 同期と同時に enabled にしないこと。
      *
      * 運用チェックリスト（本番で Supabase を有効にする前）:
-     * 1) supabase/migrations をすべて適用（app_users / game_state / device_season_registrations など）
+     * 1) supabase/migrations をすべて適用（app_users / game_state / ranking_entries / market_symbol_cache の RPC など）
      * 2) Edge Functions をデプロイ: register, login, logout, load-state, save-state, reset-password,
      *    change-password, rename-account, delete-account, ranking-snapshot（config.toml の verify_jwt=false を反映）
      * 3) シークレット: STOCKGAME_SESSION_SECRET（またはプロジェクトで使っているセッション用 env）を設定

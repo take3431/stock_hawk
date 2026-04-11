@@ -14,6 +14,8 @@ const CONFIG = Object.freeze({
   rankingKeepMonths: 24,
   quoteTtlMs: 30 * 60 * 1000,
   historyTtlMs: 12 * 60 * 60 * 1000,
+  /** refreshUsersLatest 等で同時に走らせる fetchHistory の上限（多アカウント時のフリーズ・429 回避） */
+  historyRefreshParallelism: 8,
   staleQuoteMaxMs: 24 * 60 * 60 * 1000,
   fetchGapMs: 600,
   fetchTimeoutMs: 5000,
@@ -21,6 +23,15 @@ const CONFIG = Object.freeze({
   interactiveBudgetMs: 5000,
   maxRouteAttemptsPerRequest: 2,
   proxyPrefixes: [],
+  /**
+   * finance.yahoo.com: 直取得・proxyPrefixes ルートがすべて失敗したあと、ここを順に試す（Jina 単独依存を避ける）。
+   * 接頭辞は buildFetchUrl 互換（Jina は URL 連結、他は ?url={url} や ?{url}）。
+   */
+  yahooProxyFallbackPrefixes: [
+    "https://r.jina.ai/",
+    "https://corsproxy.io/?{url}",
+    "https://api.allorigins.win/raw?url={url}"
+  ],
   enableBootAutoRefresh: false,
   loginFailWindowMs: 10 * 60 * 1000,
   loginLockMs: 10 * 60 * 1000,
@@ -43,8 +54,19 @@ const CONFIG = Object.freeze({
   clientRateAccountMax: 12,
   clientRateMyPricesWindowMs: 60 * 1000,
   clientRateMyPricesMax: 10,
-  clientRateRankWindowMs: 60 * 1000,
-  clientRateRankMax: 3,
+  /** 「最新の順位を見る」: 1日あたり上限（日本時間の日付でリセット） */
+  rankRefreshMaxPerDay: 2,
+  /** 「最新の順位を見る」: 前回成功からの最短間隔 */
+  rankRefreshMinIntervalMs: 12 * 60 * 60 * 1000,
+  /** 一括順位更新中（rankBulkYahooMinGapActive）の Yahoo 最短間隔（ms）。通常時は yahooFinanceMinGapMs（850）。 */
+  rankBulkYahooMinGapMs: 400,
+  /** Supabase 共有 market_symbol_cache のヒットとみなす最大経過時間（他ユーザーが put したデータの再利用） */
+  sharedMarketCacheTtlMs: 60 * 60 * 1000,
+  /** market-cache-get 1 リクエストあたりの銘柄数上限（サーバーと揃える） */
+  sharedMarketCacheGetChunkSize: 48,
+  /** 定期タスク直前のランダム遅延（毎回同じ秒に集中しないよう緩和）。ミリ秒。 */
+  scheduledJitterMinMs: 15 * 1000,
+  scheduledJitterMaxMs: 180 * 1000,
   clientRateDiagWindowMs: 60 * 1000,
   clientRateDiagMax: 3,
   /** 銘柄追加・確定・売却・削除・一つ戻るなど（fetch + 保存の連打） */
@@ -70,8 +92,14 @@ const CONFIG = Object.freeze({
   /** 過去の結果の月プルダウンを短時間に切り替えすぎない（描画・体感負荷対策） */
   clientRateHistoryMonthWindowMs: 60 * 1000,
   clientRateHistoryMonthMax: 24,
-  /** 同一クライアントからの Yahoo Finance（query1 / chart / search）への最短間隔（ms）。Jina 経由の間接取得も同じクロックで空ける */
-  yahooFinanceMinGapMs: 850,
+  /**
+   * 通常時: Yahoo Finance（query1 / chart / search）への最短間隔（ms）。Jina 経由も同じクロック。
+   * 一括順位更新中は rankBulkYahooMinGapMs（400）が使われる。
+   */
+  /** Yahoo（quote/chart/search）連続リクエストの最短間隔。やや長めにして無駄打ちを抑える */
+  yahooFinanceMinGapMs: 1000,
+  /** Yahoo 銘柄検索のメモリキャッシュ TTL（同一クエリの再 hit で v1/search を踏まない） */
+  yahooSearchSuggestCacheTtlMs: 12 * 60 * 1000,
   /** Yahoo 銘柄検索 API（v1/search）の連打制限（嫌がらせ・スキャン対策） */
   clientRateYahooSearchWindowMs: 60 * 1000,
   clientRateYahooSearchMax: 5,
@@ -80,8 +108,11 @@ const CONFIG = Object.freeze({
   symbolSuggestDebounceMsMobile: 320,
   /** 短時間の fetch 過多を抑止（DDoS・過負荷・異常な連打）。超過時は警告とクールダウン。 */
   abuseFetchWindowMs: 60 * 1000,
-  /** 通常利用は余裕を持たせつつ、明らかな過多のみブロック */
-  abuseFetchMaxPerWindow: 105,
+  /**
+   * 60秒ウィンドウあたりの fetch 試行上限（queuedFetch* 全ホスト合算）。
+   * 一括順位更新（Yahoo 間隔 400ms）だと理論上 ~150/分になり得るため、105 だと正常系で自己ブロックしうる。
+   */
+  abuseFetchMaxPerWindow: 200,
   abuseFetchCooldownMs: 180 * 1000,
   /** localStorage 読込時に拒否する JSON 文字列長（改ざん・メモリ圧迫対策） */
   maxLocalStorageJsonChars: 5_000_000,
@@ -89,6 +120,12 @@ const CONFIG = Object.freeze({
   maxSerializedStateSoftChars: 4_200_000,
   /** Firestore 同期ドキュメントの data 文字列上限（pull 時も検証） */
   cloudPayloadMaxChars: 1_100_000,
+  /**
+   * 起動時に ranking_snapshot_contract.json が読めたら上書きされる（版の単一ソース）。
+   * ソース: supabase/functions/_shared/ranking_snapshot_contract.json
+   * stockgame へコピー: npm run sync-ranking-contract（stockgame ディレクトリで実行）
+   */
+  rankingSnapshotMinRevision: 5,
   /** 通報理由の最大文字数 */
   maxReportReasonLength: 220,
   /** 銘柄の内部理由テキスト（改ざんで巨大化させない） */
@@ -947,6 +984,8 @@ const app = {
   nextFetchAt: 0,
   busyCounter: 0,
   interactiveFetch: false,
+  /** 「最新の順位を見る」実行中のみ Yahoo 最短間隔を rankBulkYahooMinGapMs に切り替え */
+  rankBulkYahooMinGapActive: false,
   lastApiFailure: null,
   pickDraftByUser: new Map(),
   pickUndoStack: [],
@@ -967,6 +1006,8 @@ const app = {
   /** バックグラウンド setInterval / リスナーの二重登録防止 */
   _backgroundTimersStarted: false,
   _cloudSyncPullLoopRegistered: false,
+  /** Supabase game_state.updated_at（save-state の楽観的ロック用。ログイン・load-state・保存成功で更新） */
+  _cloudGameStateUpdatedAt: "",
   els: {}
 };
 
@@ -982,6 +1023,50 @@ async function guardedSubmit(key, runner) {
   }
 }
 
+/** fire-and-forget の Promise が reject しても unhandledrejection にならないようにする */
+function safeVoid(promise, label) {
+  if (!promise || typeof promise.then !== "function") return;
+  void promise.catch((err) => {
+    console.warn(label ? `[stockgame] ${label}` : "[stockgame] async task failed", err);
+  });
+}
+
+const GLOBAL_ERROR_NOTICE_THROTTLE_MS = 12 * 1000;
+let lastGlobalErrorUserNoticeAt = 0;
+
+function notifyUnexpectedErrorToUser(kind, detail) {
+  console.error(`[stockgame] ${kind}`, detail);
+  const now = Date.now();
+  if (now - lastGlobalErrorUserNoticeAt < GLOBAL_ERROR_NOTICE_THROTTLE_MS) return;
+  lastGlobalErrorUserNoticeAt = now;
+  const msg =
+    "予期しないエラーが発生しました。表示や保存がおかしい場合はページを再読み込みしてください。";
+  try {
+    const box = document.getElementById("globalNotice");
+    if (box) {
+      box.classList.remove("hidden");
+      box.style.borderLeftColor = "#b4223a";
+      box.textContent = msg;
+    }
+  } catch (_) {}
+}
+
+function installGlobalErrorHandlers() {
+  if (typeof window === "undefined") return;
+  if (window.__stockgameGlobalErrorHandlersInstalled) return;
+  window.__stockgameGlobalErrorHandlersInstalled = true;
+  window.addEventListener("error", (ev) => {
+    if (!ev || ev.defaultPrevented) return;
+    const msg = String(ev.message || "");
+    if (/ResizeObserver|loop limit/i.test(msg)) return;
+    notifyUnexpectedErrorToUser("window.error", ev.error || ev.message || "error");
+  });
+  window.addEventListener("unhandledrejection", (ev) => {
+    const r = ev && ev.reason;
+    notifyUnexpectedErrorToUser("unhandledrejection", r instanceof Error ? r : String(r));
+  });
+}
+
 const aliasMap = buildAliasMap(SYMBOL_PRESETS);
 const symbolPresetMap = buildSymbolPresetMap(SYMBOL_PRESETS);
 
@@ -992,6 +1077,9 @@ const RECOVERY_QUESTIONS = Object.freeze([
   { id: "FIRST_PET", label: "最初に飼ったペットの名前" },
   { id: "BIRTH_CITY", label: "生まれた市区町村" }
 ]);
+
+/** 「最新の順位を見る」の 1 日回数・12 時間間隔（localStorage） */
+const RANK_REFRESH_LS_KEY = "stockgame_rank_refresh_v1";
 
 /** ブラウザ間同期用（Firebase 有効時）。UUID v4 形式のみ許可（README_CLOUD_SYNC.md 参照） */
 const STOCKGAME_SYNC_ID_KEY = "stockgame_v1_sync_id";
@@ -1009,7 +1097,47 @@ let supabaseCloudPushChain = Promise.resolve();
 /** Firebase pull の最短間隔（フォーカス連打対策） */
 let lastCloudPullAttemptMs = 0;
 let lastPublicRankingSnapshotMs = 0;
+
+/** ranking-snapshot の「タブ復帰」用スロットルとは別。これらはユーザー操作・認証変化で即サーバー同期したい */
+function rankingSnapshotSkipsVisibleThrottle(reason) {
+  const r = String(reason || "");
+  return (
+    r === "boot" ||
+    r === "scheduled" ||
+    r === "login" ||
+    r === "logout" ||
+    r === "rankingTab" ||
+    r === "register" ||
+    r === "accountDeleted"
+  );
+}
 let lastPublicSnapshotScheduledKey = "";
+/** スケジュール取得を1タブに寄せて Supabase 負荷を抑える */
+const STOCKGAME_TAB_ID = `${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+const STOCKGAME_PUB_RANK_LOCK_KEY = "stockgame_v1_pub_rank_snap_lock";
+
+function tryAcquirePublicRankSnapLock(ttlMs) {
+  try {
+    const now = Date.now();
+    const raw = localStorage.getItem(STOCKGAME_PUB_RANK_LOCK_KEY);
+    let parsed = null;
+    try {
+      parsed = raw ? JSON.parse(raw) : null;
+    } catch (_) {}
+    if (parsed && parsed.owner && parsed.until > now && parsed.owner !== STOCKGAME_TAB_ID) {
+      return false;
+    }
+    localStorage.setItem(
+      STOCKGAME_PUB_RANK_LOCK_KEY,
+      JSON.stringify({ owner: STOCKGAME_TAB_ID, until: now + ttlMs })
+    );
+    return true;
+  } catch (_) {
+    return true;
+  }
+}
+
+let lastPublicRankingFailNoticeMs = 0;
 const loadedExternalScripts = new Set();
 
 function getFirebaseSyncConfig() {
@@ -1030,7 +1158,7 @@ function getFirebaseSyncConfig() {
  * Firebase 同期より優先される（同時に有効にしないこと）。
  *
  * デプロイ一覧:
- *   register, login, logout, reset-password, load-state, save-state, change-password, rename-account, delete-account, ranking-snapshot, account-stats
+ *   register, login, logout, reset-password, load-state, save-state, change-password, rename-account, delete-account, ranking-snapshot, account-stats, market-cache-get, market-cache-put
  * CORS: credentials: omit。Edge は Allow-Origin: *。
  * sb_publishable_* は JWT ではないため、verify_jwt が有効なとき Authorization に渡すと 401（Missing authorization / Invalid JWT）になる。anonKey（eyJ…）を別途渡す。
  * サーバーで app_users 削除時は API が code: SESSION_INVALID（401）を返し、クライアントはトークン破棄＋リモートユーザーをローカルから除去する。
@@ -1138,7 +1266,7 @@ function decodeSupabaseSessionSubUnverified(token) {
 function supabasePathSkipsStale401Handling(path) {
   const p = String(path || "").replace(/^\//, "");
   return p === "login" || p === "register" || p === "reset-password" || p === "ranking-snapshot" ||
-    p === "account-stats";
+    p === "account-stats" || p === "market-cache-get";
 }
 
 /**
@@ -1150,6 +1278,7 @@ function applySupabaseSessionInvalidated(tokenSnapshot, opts) {
   const purgeRemote = Boolean(opts && opts.purgeRemoteUser);
   const hadToken = Boolean(tokenSnapshot);
   clearSupabaseSessionToken();
+  app._cloudGameStateUpdatedAt = "";
 
   if (purgeRemote && tokenSnapshot) {
     const sub = decodeSupabaseSessionSubUnverified(tokenSnapshot);
@@ -1332,7 +1461,10 @@ async function supabaseCloudFetch(path, init = {}) {
   const safePath = assertSafeSupabaseEdgePath(path);
   const headers = new Headers(init.headers || {});
   headers.set("Content-Type", "application/json");
-  setSupabaseEdgeFetchHeaders(headers, cfg);
+  const bearerOpts = Object.prototype.hasOwnProperty.call(init, "bearerToken")
+    ? { bearerToken: init.bearerToken }
+    : {};
+  setSupabaseEdgeFetchHeaders(headers, cfg, bearerOpts);
   const url = `${cfg.functionsBaseUrl}/${safePath}`;
   const fetchOpts = {
     method: init.method || "POST",
@@ -1361,9 +1493,176 @@ async function supabaseCloudFetch(path, init = {}) {
     } else if (res.status === 401 && !supabasePathSkipsStale401Handling(path)) {
       applySupabaseSessionInvalidated(tokenSnapshot, { purgeRemoteUser: false });
     }
-    throw new Error(msg);
+    const err = new Error(msg);
+    err.status = res.status;
+    if (code) err.code = code;
+    if (data && typeof data === "object") {
+      err.details = data;
+      if (typeof data.serverUpdatedAt === "string" && data.serverUpdatedAt.trim()) {
+        err.serverUpdatedAt = data.serverUpdatedAt.trim();
+      }
+    }
+    throw err;
   }
   return data;
+}
+
+let sharedMarketPutFlushTimer = null;
+const sharedMarketPutPendingHistory = new Map();
+const sharedMarketPutPendingQuote = new Map();
+
+function sharedMarketTtlSec() {
+  const ms = Number(CONFIG.sharedMarketCacheTtlMs) || 3600000;
+  return Math.max(60, Math.min(7200, Math.floor(ms / 1000)));
+}
+
+function scheduleSharedMarketPutFlush() {
+  if (sharedMarketPutFlushTimer != null) return;
+  sharedMarketPutFlushTimer = setTimeout(() => {
+    sharedMarketPutFlushTimer = null;
+    safeVoid(flushSharedMarketPutQueue(), "flushSharedMarketPutQueue");
+  }, 900);
+}
+
+function queueSharedMarketHistoryPut(symbol, rows) {
+  if (!getSupabaseCloudConfig()) return;
+  if (!getSupabaseSessionToken()) return;
+  if (inferMarketFromKnownSymbol(symbol) === "CRYPTO") return;
+  const sym = String(symbol || "").toUpperCase();
+  if (!sym || !Array.isArray(rows) || !rows.length) return;
+  sharedMarketPutPendingHistory.set(sym, rows.slice(-220));
+  scheduleSharedMarketPutFlush();
+}
+
+function queueSharedMarketQuotePut(symbol, data) {
+  if (!getSupabaseCloudConfig()) return;
+  if (!getSupabaseSessionToken()) return;
+  if (inferMarketFromKnownSymbol(symbol) === "CRYPTO") return;
+  const sym = String(symbol || "").toUpperCase();
+  if (!sym || !data || typeof data !== "object") return;
+  const price = toFiniteNumber(data.price);
+  if (price == null) return;
+  sharedMarketPutPendingQuote.set(sym, {
+    symbol: sym,
+    name: typeof data.name === "string" ? data.name : sym,
+    price,
+    asOfMs: Number.isFinite(Number(data.asOfMs)) ? Number(data.asOfMs) : Date.now()
+  });
+  scheduleSharedMarketPutFlush();
+}
+
+async function flushSharedMarketPutQueue() {
+  if (!getSupabaseSessionToken()) {
+    sharedMarketPutPendingHistory.clear();
+    sharedMarketPutPendingQuote.clear();
+    return;
+  }
+  const bySym = new Map();
+  for (const [sym, rows] of sharedMarketPutPendingHistory.entries()) {
+    if (!bySym.has(sym)) bySym.set(sym, { symbol: sym });
+    bySym.get(sym).history = { rows };
+  }
+  sharedMarketPutPendingHistory.clear();
+  for (const [sym, q] of sharedMarketPutPendingQuote.entries()) {
+    if (!bySym.has(sym)) bySym.set(sym, { symbol: sym });
+    bySym.get(sym).quote = q;
+  }
+  sharedMarketPutPendingQuote.clear();
+  const entries = [...bySym.values()].filter((e) => e.quote || e.history);
+  if (!entries.length) return;
+  const chunkSize = 25;
+  for (let i = 0; i < entries.length; i += chunkSize) {
+    const chunk = entries.slice(i, i + chunkSize);
+    try {
+      await supabaseCloudFetch("market-cache-put", { body: JSON.stringify({ entries: chunk }) });
+    } catch (e) {
+      console.warn("market-cache-put failed", e);
+    }
+  }
+}
+
+async function hydrateSharedMarketHistoryBatch(symbols) {
+  if (!getSupabaseCloudConfig() || !symbols?.length) return;
+  const ttlSec = sharedMarketTtlSec();
+  const chunkSize = Math.max(8, Math.min(80, Math.floor(Number(CONFIG.sharedMarketCacheGetChunkSize)) || 48));
+  const syms = [...new Set(symbols.map((s) => String(s || "").toUpperCase()).filter(Boolean))].filter(
+    (s) => inferMarketFromKnownSymbol(s) !== "CRYPTO"
+  );
+  for (let i = 0; i < syms.length; i += chunkSize) {
+    const part = syms.slice(i, i + chunkSize);
+    try {
+      const data = await supabaseCloudFetch("market-cache-get", {
+        body: JSON.stringify({ kind: "history", symbols: part, ttlSec }),
+        bearerToken: null
+      });
+      if (!data?.ok || !data.hit) continue;
+      for (const sym of Object.keys(data.hit)) {
+        const pack = data.hit[sym];
+        const rows = pack?.rows;
+        if (!Array.isArray(rows) || !rows.length) continue;
+        const t = pack.updatedAt ? Date.parse(String(pack.updatedAt)) : NaN;
+        const ts = Number.isFinite(t) ? t : Date.now();
+        cacheHistoryRows(sym, rows, ts);
+      }
+    } catch (e) {
+      console.warn("market-cache-get history batch failed", e);
+    }
+  }
+}
+
+async function tryHydrateSharedMarketHistoryOne(symbol) {
+  if (!getSupabaseCloudConfig()) return;
+  const sym = String(symbol || "").toUpperCase();
+  if (!sym || inferMarketFromKnownSymbol(sym) === "CRYPTO") return;
+  const ttlSec = sharedMarketTtlSec();
+  try {
+    const data = await supabaseCloudFetch("market-cache-get", {
+      body: JSON.stringify({ kind: "history", symbols: [sym], ttlSec }),
+      bearerToken: null
+    });
+    if (!data?.ok || !data.hit?.[sym]) return;
+    const pack = data.hit[sym];
+    const rows = pack?.rows;
+    if (!Array.isArray(rows) || !rows.length) return;
+    const t = pack.updatedAt ? Date.parse(String(pack.updatedAt)) : NaN;
+    const ts = Number.isFinite(t) ? t : Date.now();
+    cacheHistoryRows(sym, rows, ts);
+  } catch (e) {
+    console.warn("market-cache-get history one failed", e);
+  }
+}
+
+async function tryHydrateSharedMarketQuoteOne(symbol) {
+  if (!getSupabaseCloudConfig()) return;
+  const sym = String(symbol || "").toUpperCase();
+  if (!sym || inferMarketFromKnownSymbol(sym) === "CRYPTO") return;
+  const ttlSec = sharedMarketTtlSec();
+  try {
+    const data = await supabaseCloudFetch("market-cache-get", {
+      body: JSON.stringify({ kind: "quote", symbols: [sym], ttlSec }),
+      bearerToken: null
+    });
+    if (!data?.ok || !data.hit?.[sym]) return;
+    const pack = data.hit[sym];
+    const q = pack?.quote;
+    if (!q || typeof q !== "object") return;
+    const price = toFiniteNumber(q.price);
+    if (price == null) return;
+    const t = pack.updatedAt ? Date.parse(String(pack.updatedAt)) : NaN;
+    const ts = Number.isFinite(t) ? t : Date.now();
+    cacheQuoteData(
+      sym,
+      {
+        symbol: sym,
+        name: typeof q.name === "string" && q.name.trim() ? q.name.trim() : sym,
+        price,
+        asOfMs: Number.isFinite(Number(q.asOfMs)) ? Number(q.asOfMs) : ts
+      },
+      ts
+    );
+  } catch (e) {
+    console.warn("market-cache-get quote one failed", e);
+  }
 }
 
 function isValidSyncId(id) {
@@ -1487,10 +1786,50 @@ async function pushSupabaseCloudState() {
       return;
     }
     const clone = JSON.parse(json);
-    await supabaseCloudFetch("save-state", {
-      body: JSON.stringify({ state: clone })
+    const ifNm =
+      typeof app._cloudGameStateUpdatedAt === "string" && app._cloudGameStateUpdatedAt.trim()
+        ? app._cloudGameStateUpdatedAt.trim()
+        : "";
+    const payload = ifNm ? { state: clone, ifNotModifiedSince: ifNm } : { state: clone };
+    const data = await supabaseCloudFetch("save-state", {
+      body: JSON.stringify(payload)
     });
+    if (data && typeof data.serverUpdatedAt === "string" && data.serverUpdatedAt.trim()) {
+      app._cloudGameStateUpdatedAt = data.serverUpdatedAt.trim();
+    }
   } catch (e) {
+    const st = e && typeof e.status === "number" ? e.status : 0;
+    const code = e && e.code;
+    if (st === 409 && code === "state_conflict") {
+      if (e.serverUpdatedAt) app._cloudGameStateUpdatedAt = String(e.serverUpdatedAt).trim();
+      try {
+        const pulled = await supabaseCloudFetch("load-state", { body: "{}" });
+        if (pulled?.state && typeof pulled.state === "object") {
+          app.state = normalizeState(pulled.state);
+          if (app.state.sessionUserId) app.sessionUserId = app.state.sessionUserId;
+          if (typeof pulled.serverUpdatedAt === "string" && pulled.serverUpdatedAt.trim()) {
+            app._cloudGameStateUpdatedAt = pulled.serverUpdatedAt.trim();
+          }
+          saveState({ skipCloudPush: true });
+          if (typeof showGlobalNotice === "function") {
+            showGlobalNotice(
+              "サーバー側で約定などが更新されていたため、最新の保存データに置き換えました。直前に追加した銘柄が消えている場合は、もう一度追加してください。",
+              true
+            );
+          }
+          if (typeof renderAll === "function") renderAll();
+        }
+      } catch (pullErr) {
+        console.warn("save-state conflict: reload failed", pullErr);
+        if (typeof showGlobalNotice === "function") {
+          showGlobalNotice(
+            "サーバー側の状態が新しくなっています。ページを再読み込みするか、しばらくしてから再度保存してください。",
+            true
+          );
+        }
+      }
+      return;
+    }
     console.warn("supabase cloud push failed", e);
     const msg = e instanceof Error ? e.message : String(e);
     if (/大きすぎ|413|too large/i.test(msg) && typeof showGlobalNotice === "function") {
@@ -1551,6 +1890,75 @@ function scheduleCloudPush() {
   }
 }
 
+/** デバウンス待ちを捨て、直後に 1 回だけクラウドへ送る（ranking-snapshot が即読んでも古い行を見ないようにする） */
+function cancelScheduledCloudPush() {
+  if (cloudPushTimer) {
+    clearTimeout(cloudPushTimer);
+    cloudPushTimer = null;
+  }
+  if (supabaseCloudPushTimer) {
+    clearTimeout(supabaseCloudPushTimer);
+    supabaseCloudPushTimer = null;
+  }
+}
+
+async function flushCloudPushNow() {
+  const backend = getCloudSyncBackend();
+  if (backend === "firebase") {
+    cancelScheduledCloudPush();
+    firebaseCloudPushChain = firebaseCloudPushChain
+      .then(() => pushCloudState())
+      .catch((e) => console.warn("firebase cloud push failed", e));
+    await firebaseCloudPushChain;
+    return;
+  }
+  if (backend === "supabase") {
+    cancelScheduledCloudPush();
+    supabaseCloudPushChain = supabaseCloudPushChain
+      .then(() => pushSupabaseCloudState())
+      .catch((e) => console.warn("supabase cloud push failed", e));
+    await supabaseCloudPushChain;
+  }
+}
+
+/**
+ * 任意: `window.STOCKGAME_RECOMPUTE_SECRET` に Edge の `STOCKGAME_RECOMPUTE_SECRET` と同じ値を設定すると、
+ * 定時ランキング更新から `recompute-ranking` を呼ぶ。サーバー側で先に全件 settlement（約定補完）が走り、その後 ranking 再計算される。
+ * 未設定ならスキップ（本番では Supabase Scheduled で settlement-executor / repair-missed-settlements を推奨）。
+ */
+async function triggerRemoteRankingRecomputeBestEffort() {
+  const cfg = getSupabaseCloudConfig();
+  if (!cfg) return;
+  const secret =
+    typeof window !== "undefined" && window.STOCKGAME_RECOMPUTE_SECRET != null
+      ? String(window.STOCKGAME_RECOMPUTE_SECRET).trim()
+      : "";
+  if (!secret) return;
+  const url = `${cfg.functionsBaseUrl}/recompute-ranking`;
+  const headers = new Headers();
+  headers.set("Content-Type", "application/json");
+  if (cfg.apikeyHeader) headers.set("apikey", cfg.apikeyHeader);
+  headers.set("Authorization", `Bearer ${secret}`);
+  const res = await fetch(url, {
+    method: "POST",
+    mode: "cors",
+    credentials: "omit",
+    headers,
+    body: "{}",
+    signal:
+      typeof AbortSignal !== "undefined" && typeof AbortSignal.timeout === "function"
+        ? AbortSignal.timeout(120000)
+        : undefined
+  });
+  if (!res.ok) {
+    let t = "";
+    try {
+      t = await res.text();
+    } catch (_) {}
+    console.warn("[stockgame] recompute-ranking HTTP", res.status, t);
+  }
+}
+
 /** @returns {Promise<boolean>} Supabase リモートを取り込んで状態を更新したら true */
 async function supabaseCloudPullIfNewer() {
   const cfg = getSupabaseCloudConfig();
@@ -1564,6 +1972,9 @@ async function supabaseCloudPullIfNewer() {
   lastCloudPullAttemptMs = now;
   try {
     const data = await supabaseCloudFetch("load-state", { body: "{}" });
+    if (data && typeof data.serverUpdatedAt === "string" && data.serverUpdatedAt.trim()) {
+      app._cloudGameStateUpdatedAt = data.serverUpdatedAt.trim();
+    }
     const remote = data && data.state;
     if (!remote || typeof remote !== "object") return false;
     const remoteMs = Number(remote.lastSavedAtMs) || 0;
@@ -1593,40 +2004,168 @@ function rankingSnapshotRowsSig(r) {
   return `${String(r.season || "")}\x1e${String(r.settledAt || "")}\x1e${rows.length}\x1e${ids}`;
 }
 
+/** 件数・mergedAt だけでは検知できないスコア更新で authoritative を更新した扱いにする */
+function authoritativeLiveRowsContentSig(rows) {
+  if (!Array.isArray(rows) || !rows.length) return "0";
+  try {
+    return rows
+      .map((r) => {
+        if (!r || typeof r !== "object") return "";
+        const uid = String(r.userId || "");
+        const rp =
+          r.returnPct === null || r.returnPct === undefined
+            ? "n"
+            : String(toFiniteNumber(r.returnPct) ?? "x");
+        const vc = String(r.validPickCount ?? "");
+        const hs = r.hasScore ? "1" : "0";
+        const tl = Array.isArray(r.trades) ? r.trades.length : 0;
+        const opc = String(r.openPendingCount ?? "");
+        const rn = String(r.rankNote ?? "");
+        const bp = Array.isArray(r.buyPendingSymbols) ? r.buyPendingSymbols.length : 0;
+        const sp = Array.isArray(r.sellPendingSymbols) ? r.sellPendingSymbols.length : 0;
+        return `${uid}\x1f${rp}\x1f${vc}\x1f${hs}\x1f${tl}\x1f${opc}\x1f${rn}\x1f${bp}\x1f${sp}`;
+      })
+      .sort()
+      .join("\x1e");
+  } catch (_) {
+    return "";
+  }
+}
+
 function mergePublicRankingSnapshot(data) {
   if (!data || !data.ok) return false;
-  const usersArr = Array.isArray(data.users) ? data.users : [];
-  const sessionId = app.sessionUserId || null;
-  const snapshotUserIds = new Set();
-  let changed = false;
-  const byId = new Map((app.state.users || []).map((u) => [u.id, u]));
-  for (const raw of usersArr) {
-    if (!raw || typeof raw !== "object" || typeof raw.id !== "string") continue;
-    if (raw.isDeleted) continue;
-    snapshotUserIds.add(raw.id);
-    if (sessionId && raw.id === sessionId) continue;
-    const nu = normalizeUser(raw);
-    if (!nu || !nu.id) continue;
-    const existing = byId.get(nu.id);
-    if (!existing) {
-      byId.set(nu.id, nu);
-      changed = true;
-      continue;
+  const rev = Number(data.rankingSnapshotRevision);
+  if (Number.isFinite(rev) && rev < CONFIG.rankingSnapshotMinRevision) {
+    if (!app._rankingSnapshotRevWarned) {
+      app._rankingSnapshotRevWarned = true;
+      console.warn(
+        `[stockgame] ranking-snapshot Edge revision ${rev} < client min ${CONFIG.rankingSnapshotMinRevision}. Deploy the latest ranking-snapshot Edge.`,
+      );
     }
-    const nT = Date.parse(nu.updatedAt || "") || 0;
-    const eT = Date.parse(existing.updatedAt || "") || 0;
-    if (nT > eT) {
-      byId.set(nu.id, nu);
+  }
+  let changed = false;
+  const remoteContentSig = (u) => {
+    try {
+      return JSON.stringify([u.picks, u.picksLastConfirmed, u.aliasName, u.name, u.season, u.isDeleted]);
+    } catch (_) {
+      return "";
+    }
+  };
+  /**
+   * ranking-snapshot は全 game_state を集約した「いまの対戦月」。ここをローカルと揃えないと
+   * calcUserScore / buildLiveRanking が別月の picks を見て順位が崩れる。
+   */
+  if (typeof data.currentSeason === "string" && /^\d{4}-\d{2}$/.test(data.currentSeason.trim())) {
+    const nextSeason = data.currentSeason.trim();
+    if (app.state.currentSeason !== nextSeason) {
+      app.state.currentSeason = nextSeason;
       changed = true;
     }
   }
-  /* ranking-snapshot に含まれない remote ユーザーは DB から消えたとみなして除去（ライブランキング用） */
-  for (const [id, u] of [...byId.entries()]) {
-    if (sessionId && id === sessionId) continue;
-    if (!u || String(u.passwordAlgo || "") !== "remote") continue;
-    if (!snapshotUserIds.has(id)) {
-      byId.delete(id);
+
+  const authSeasonRaw =
+    typeof data.authoritativeLiveSeason === "string" ? data.authoritativeLiveSeason.trim() : "";
+  const authRowsRaw = Array.isArray(data.authoritativeLiveRows) ? data.authoritativeLiveRows : null;
+  if (authSeasonRaw && /^\d{4}-\d{2}$/.test(authSeasonRaw) && authRowsRaw) {
+    const authSig = `${authSeasonRaw}|${authRowsRaw.length}|${String(data.mergedAt || "")}|${String(data.snapshotId || "")}|${String(data.snapshotAt || "")}|${authoritativeLiveRowsContentSig(authRowsRaw)}`;
+    if (app._authoritativeLiveSig !== authSig) {
+      app._authoritativeLiveSig = authSig;
       changed = true;
+    }
+    app._authoritativeLiveRows = authRowsRaw;
+    app._authoritativeLiveSeason = authSeasonRaw;
+  } else {
+    if (app._authoritativeLiveRows != null) changed = true;
+    app._authoritativeLiveRows = null;
+    app._authoritativeLiveSeason = null;
+    app._authoritativeLiveSig = "";
+    app._publicRankingSnapshotId = "";
+    app._liveRankDataFreshness = "";
+  }
+
+  const snapAtRaw =
+    typeof data.snapshotAt === "string" && data.snapshotAt.trim()
+      ? data.snapshotAt.trim()
+      : typeof data.mergedAt === "string" && data.mergedAt.trim()
+        ? data.mergedAt.trim()
+        : "";
+  if (snapAtRaw && app.state.publicRankingSnapshotAt !== snapAtRaw) {
+    app.state.publicRankingSnapshotAt = snapAtRaw;
+    changed = true;
+  } else if (snapAtRaw) {
+    app.state.publicRankingSnapshotAt = snapAtRaw;
+  }
+
+  const snapIdRaw = typeof data.snapshotId === "string" ? data.snapshotId.trim() : "";
+  if (snapIdRaw !== String(app._publicRankingSnapshotId || "")) {
+    app._publicRankingSnapshotId = snapIdRaw;
+    changed = true;
+  }
+  const freshRaw =
+    typeof data.liveRankDataFreshness === "string" ? data.liveRankDataFreshness.trim() : "";
+  if (freshRaw !== String(app._liveRankDataFreshness || "")) {
+    app._liveRankDataFreshness = freshRaw;
+    changed = true;
+  }
+
+  const usersArr = Array.isArray(data.users) ? data.users : [];
+  const sessionId = app.sessionUserId || null;
+  const snapshotUserIds = new Set();
+  const byId = new Map((app.state.users || []).map((u) => [u.id, u]));
+  const sourceSnapshotsN = Number(data.sourceSnapshots);
+  const suspiciousEmptyUsers =
+    usersArr.length === 0 && Number.isFinite(sourceSnapshotsN) && sourceSnapshotsN > 0;
+
+  for (const raw of usersArr) {
+    try {
+      if (!raw || typeof raw !== "object" || typeof raw.id !== "string") continue;
+      if (isUserMarkedDeletedRaw(raw.isDeleted)) continue;
+      snapshotUserIds.add(raw.id);
+      if (sessionId && raw.id === sessionId) continue;
+      const nu = normalizeUser(raw);
+      if (!nu || !nu.id) continue;
+      const existing = byId.get(nu.id);
+      if (!existing) {
+        byId.set(nu.id, nu);
+        changed = true;
+        continue;
+      }
+      /**
+       * strip_state 済みのユーザーは常に remote。updatedAt だけ比較すると「同秒更新」や端末時計ずれで
+       * サーバー側の最新 picks がマージされず、ログイン直後・logout 直後に順位だけ古いまま残る。
+       * ログイン中の session ユーザー以外は、スナップショット取得のたびにサーバー行を優先する。
+       */
+      const nT = Date.parse(nu.updatedAt || "") || 0;
+      const eT = Date.parse(existing.updatedAt || "") || 0;
+      if (String(existing.passwordAlgo || "") === "remote") {
+        if (nT > eT || (nT === eT && remoteContentSig(existing) !== remoteContentSig(nu))) {
+          byId.set(nu.id, nu);
+          changed = true;
+        }
+        continue;
+      }
+      if (nT > eT) {
+        byId.set(nu.id, nu);
+        changed = true;
+      }
+    } catch (rowErr) {
+      console.warn("[stockgame] mergePublicRankingSnapshot: skip malformed user row", rowErr);
+    }
+  }
+  /* ranking-snapshot に含まれない remote ユーザーは DB から消えたとみなして除去（ライブランキング用） */
+  /* 行はあるのに users が空＝サーバー異常のとき全削除するとランキングが壊れるためスキップ */
+  if (suspiciousEmptyUsers) {
+    console.warn(
+      "[stockgame] ranking-snapshot returned no users while sourceSnapshots>0; skipping remote purge"
+    );
+  } else {
+    for (const [id, u] of [...byId.entries()]) {
+      if (sessionId && id === sessionId) continue;
+      if (!u || String(u.passwordAlgo || "") !== "remote") continue;
+      if (!snapshotUserIds.has(id)) {
+        byId.delete(id);
+        changed = true;
+      }
     }
   }
   if (changed) {
@@ -1638,24 +2177,28 @@ function mergePublicRankingSnapshot(data) {
     const bySeason = new Map((app.state.rankings || []).map((r) => [r.season, r]));
     let rChanged = false;
     for (const raw of remRank) {
-      if (!raw || typeof raw !== "object" || typeof raw.season !== "string") continue;
-      const nr = normalizeRanking(raw);
-      const prev = bySeason.get(nr.season);
-      const prevN = prev && Array.isArray(prev.rows) ? prev.rows.length : 0;
-      const nextN = Array.isArray(nr.rows) ? nr.rows.length : 0;
-      const prevT = prev && prev.settledAt ? Date.parse(prev.settledAt) : 0;
-      const nextT = nr.settledAt ? Date.parse(nr.settledAt) : 0;
-      const sigPrev = prev ? rankingSnapshotRowsSig(prev) : "";
-      const sigNext = rankingSnapshotRowsSig(nr);
-      if (
-        !prev ||
-        nextN > prevN ||
-        nextN < prevN ||
-        (nextN === prevN && nextT > prevT) ||
-        sigPrev !== sigNext
-      ) {
-        bySeason.set(nr.season, nr);
-        rChanged = true;
+      try {
+        if (!raw || typeof raw !== "object" || typeof raw.season !== "string") continue;
+        const nr = normalizeRanking(raw);
+        const prev = bySeason.get(nr.season);
+        const prevN = prev && Array.isArray(prev.rows) ? prev.rows.length : 0;
+        const nextN = Array.isArray(nr.rows) ? nr.rows.length : 0;
+        const prevT = prev && prev.settledAt ? Date.parse(prev.settledAt) : 0;
+        const nextT = nr.settledAt ? Date.parse(nr.settledAt) : 0;
+        const sigPrev = prev ? rankingSnapshotRowsSig(prev) : "";
+        const sigNext = rankingSnapshotRowsSig(nr);
+        if (
+          !prev ||
+          nextN > prevN ||
+          nextN < prevN ||
+          (nextN === prevN && nextT > prevT) ||
+          sigPrev !== sigNext
+        ) {
+          bySeason.set(nr.season, nr);
+          rChanged = true;
+        }
+      } catch (rankErr) {
+        console.warn("[stockgame] mergePublicRankingSnapshot: skip malformed ranking", rankErr);
       }
     }
     if (rChanged) {
@@ -1669,23 +2212,67 @@ function mergePublicRankingSnapshot(data) {
 }
 
 /**
+ * stockgame と同じディレクトリの ranking_snapshot_contract.json から期待リビジョンを読み、CONFIG を更新する。
+ * ファイルが無い・失敗時は CONFIG のフォールバック値のまま。
+ */
+async function hydrateRankingSnapshotContractFromStatic() {
+  try {
+    const script = document.querySelector('script[src*="stockgame.js"]');
+    const srcAttr = script && script.getAttribute("src");
+    if (!srcAttr) return;
+    const scriptUrl = new URL(srcAttr, document.baseURI);
+    scriptUrl.hash = "";
+    const contractUrl = new URL("ranking_snapshot_contract.json", scriptUrl);
+    contractUrl.search = "";
+    const res = await fetch(contractUrl.href, { cache: "no-store", credentials: "same-origin" });
+    if (!res.ok) return;
+    const text = await res.text();
+    let parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      console.warn("[stockgame] ranking_snapshot_contract.json: invalid JSON", e);
+      return;
+    }
+    const v = Number(parsed && parsed.rankingSnapshotRevision);
+    if (Number.isFinite(v) && v >= 1) {
+      CONFIG.rankingSnapshotMinRevision = v;
+    }
+  } catch (_) {
+    /* オフライン・パス不一致は無視 */
+  }
+}
+
+/**
  * 未ログインでも他ブラウザの登録がランキングに載るよう、DB 上の全スナップショットをマージ取得。
  * Yahoo は使わずサーバーの game_state のみ参照。
- * @param {"boot"|"visible"|"scheduled"} reason
- * @returns {Promise<boolean>}
+ * @param {"boot"|"visible"|"scheduled"|"login"|"logout"|"rankingTab"|"register"|"accountDeleted"} reason
+ * @returns {Promise<boolean>} state をマージで更新したら true
  */
 async function pullPublicRankingSnapshot(reason) {
   if (!getSupabaseCloudConfig()) return false;
   const now = Date.now();
   const minMs = CONFIG.publicRankingSnapshotMinIntervalMs;
-  if (reason !== "boot" && reason !== "scheduled") {
+  if (!rankingSnapshotSkipsVisibleThrottle(reason)) {
     if (lastPublicRankingSnapshotMs && now - lastPublicRankingSnapshotMs < minMs) return false;
   }
   try {
     const data = await supabaseCloudFetch("ranking-snapshot", { body: "{}" });
     if (!data || !data.ok) return false;
-    const changed = mergePublicRankingSnapshot(data);
+    let changed = false;
+    try {
+      changed = mergePublicRankingSnapshot(data);
+    } catch (err) {
+      console.warn("mergePublicRankingSnapshot failed", err);
+      app._authoritativeLiveRows = null;
+      app._authoritativeLiveSeason = null;
+      app._authoritativeLiveSig = "";
+      app._publicRankingSnapshotId = "";
+      app._liveRankDataFreshness = "";
+      return false;
+    }
     lastPublicRankingSnapshotMs = Date.now();
+    app._lastLiveRankKey = "";
     if (changed) {
       try {
         saveState();
@@ -1694,11 +2281,32 @@ async function pullPublicRankingSnapshot(reason) {
     return changed;
   } catch (e) {
     console.warn("ranking-snapshot failed", e);
+    const n = Date.now();
+    const errText = String((e && e.message) || e || "");
+    if (!lastPublicRankingFailNoticeMs || n - lastPublicRankingFailNoticeMs > 300000) {
+      lastPublicRankingFailNoticeMs = n;
+      if (typeof showGlobalNotice === "function") {
+        const isAuthHint =
+          !getSupabaseSessionToken() &&
+          /401|403|JWT|Unauthorized|authorization|Missing authorization|Invalid JWT/i.test(errText);
+        showGlobalNotice(
+          isAuthHint
+            ? "ランキング更新に失敗しました。Supabase の anonKey（JWT）未設定やゲートウェイ設定をご確認ください。"
+            : "ランキング更新に失敗しました。しばらくしてから再読み込みしてください。",
+          false
+        );
+      }
+    }
+    app._authoritativeLiveRows = null;
+    app._authoritativeLiveSeason = null;
+    app._authoritativeLiveSig = "";
+    app._publicRankingSnapshotId = "";
+    app._liveRankDataFreshness = "";
     return false;
   }
 }
 
-/** 日本時間 0/6/12/18 時台に 1 回ずつ ranking-snapshot を取得（1 日最大 4 回） */
+/** 6/18/21 時台は時台+4分。0/12 時台は 35 分（定時 refresh 0:31 通過後の再 pull） */
 function startPublicRankingSnapshotTimer() {
   if (!getSupabaseCloudConfig() || app._publicRankingSnapTimerStarted) return;
   app._publicRankingSnapTimerStarted = true;
@@ -1706,13 +2314,20 @@ function startPublicRankingSnapshotTimer() {
   setInterval(() => {
     if (document.visibilityState !== "visible") return;
     const p = getTimePartsByZone(new Date(), CONFIG.jstTimeZone);
-    if (p.minute !== 4) return;
+    const minuteTarget = p.hour === 0 || p.hour === 12 ? 35 : 4;
+    if (p.minute !== minuteTarget) return;
     if (!SLOTS.includes(p.hour)) return;
     const key = `${p.year}-${p.month}-${p.day}-${p.hour}`;
     if (key === lastPublicSnapshotScheduledKey) return;
-    lastPublicSnapshotScheduledKey = key;
-    void pullPublicRankingSnapshot("scheduled").then((applied) => {
-      if (applied && typeof renderAll === "function") renderAll();
+    const jitterKey = `pubRankSnap|${key}`;
+    runAfterScheduledJitter(jitterKey, () => {
+      if (!tryAcquirePublicRankSnapLock(120000)) return;
+      lastPublicSnapshotScheduledKey = key;
+      void pullPublicRankingSnapshot("scheduled")
+        .then((applied) => {
+          if (applied && typeof renderAll === "function") renderAll();
+        })
+        .catch((e) => console.warn("[stockgame] pullPublicRankingSnapshot scheduled", e));
     });
   }, 60 * 1000);
 }
@@ -1788,12 +2403,12 @@ function startCloudSyncPullLoop() {
     }
   };
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") void run();
+    if (document.visibilityState === "visible") safeVoid(run(), "cloudSyncPullLoop");
   });
-  window.addEventListener("focus", () => void run());
+  window.addEventListener("focus", () => safeVoid(run(), "cloudSyncPullLoop"));
   setInterval(() => {
     if (document.visibilityState !== "visible") return;
-    void run();
+    safeVoid(run(), "cloudSyncPullLoop");
   }, 45000);
 }
 
@@ -1815,6 +2430,7 @@ function showBootInitError(err) {
 
 document.addEventListener("DOMContentLoaded", () => {
   try {
+    installGlobalErrorHandlers();
     registerSaveStateLifecycleHooks();
   } catch (e) {
     showBootInitError(e);
@@ -1835,6 +2451,7 @@ function patchLoginChromeFromSession() {
 
 async function initializeApp() {
   app.els = getElements();
+  await hydrateRankingSnapshotContractFromStatic();
   wireEvents();
   renderHintChips();
   hydrateSyncIdFromUrl();
@@ -1842,7 +2459,7 @@ async function initializeApp() {
   app.sessionUserId = app.state.sessionUserId || null;
   patchLoginChromeFromSession();
   updateActionAvailability();
-  void refreshCloudAccountRegistrationStats();
+  safeVoid(refreshCloudAccountRegistrationStats(), "refreshCloudAccountRegistrationStats");
   // company_master.json は初回描画を遅らせない。銘柄欄フォーカス・市場JP/AUTO・プレビュー等で遅延ロード。
 
   const pulled = await cloudPullIfNewer();
@@ -1855,48 +2472,92 @@ async function initializeApp() {
     patchLoginChromeFromSession();
     updateActionAvailability();
   }
+  if (getSupabaseCloudConfig()) {
+    safeVoid(loadJpCompanyMaster(), "loadJpCompanyMasterBoot");
+  }
   hydrateSettingsFromQuery();
 
   try {
     await rollSeasonIfNeeded();
     renderAll();
-    app.initialized = true;
     if (CONFIG.enableBootAutoRefresh) {
       await refreshDailyPricesIfNeeded();
     } else {
       void refreshDailyPricesIfNeeded().catch((err) => console.error("background refresh failed", err));
     }
-    if (!app._backgroundTimersStarted) {
-      app._backgroundTimersStarted = true;
-      startRankingAutoRefreshTimer();
-      startJpAutoUpdateTimers();
-      startUsAutoUpdateTimers();
-      startCryptoAutoUpdateTimers();
-      startPendingAutoFixTimer();
-      startCloudSyncPullLoop();
-      startPublicRankingSnapshotTimer();
-    }
   } catch (error) {
     console.error(error);
-    showGlobalNotice("初期化に失敗しました。ページを再読み込みしてください。", true);
-    renderAll();
+    showGlobalNotice(
+      "初期化の一部に失敗しました。ランキングや自動更新が止まる場合はページを再読み込みしてください。",
+      true
+    );
+    try {
+      renderAll();
+    } catch (renderErr) {
+      console.error("renderAll after partial init failure", renderErr);
+    }
+  } finally {
+    app.initialized = true;
+    if (!app._backgroundTimersStarted) {
+      app._backgroundTimersStarted = true;
+      try {
+        startRankingAutoRefreshTimer();
+        startJpAutoUpdateTimers();
+        startUsAutoUpdateTimers();
+        startCryptoAutoUpdateTimers();
+        startPendingAutoFixTimer();
+        startCloudSyncPullLoop();
+        startPublicRankingSnapshotTimer();
+      } catch (timerErr) {
+        console.error("background timer registration failed", timerErr);
+      }
+    }
   }
+}
+
+/** 同じキーの定期処理が二重にジッター予約されないようにする */
+const scheduledJitterPendingKeys = new Set();
+
+function pickScheduledJitterMs() {
+  const minJ = Math.max(0, Math.floor(Number(CONFIG.scheduledJitterMinMs) || 0));
+  const maxJ = Math.max(minJ, Math.floor(Number(CONFIG.scheduledJitterMaxMs) || minJ));
+  if (maxJ <= minJ) return minJ;
+  return minJ + Math.floor(Math.random() * (maxJ - minJ + 1));
+}
+
+function runAfterScheduledJitter(slotKey, runFn) {
+  if (!slotKey || typeof runFn !== "function") return;
+  if (scheduledJitterPendingKeys.has(slotKey)) return;
+  scheduledJitterPendingKeys.add(slotKey);
+  const ms = pickScheduledJitterMs();
+  window.setTimeout(() => {
+    scheduledJitterPendingKeys.delete(slotKey);
+    try {
+      runFn();
+    } catch (e) {
+      console.error("scheduled jitter task failed", e);
+    }
+  }, ms);
 }
 
 function startRankingAutoRefreshTimer() {
   const CHECK_MS = 60 * 1000;
   let lastRunKey = "";
+  /* サーバ一括再計算 0:30/12:30 JST の直後に snapshot を取り込む（提案書どおり 0:31/12:31） */
   setInterval(() => {
     if (document.visibilityState !== "visible") return;
     const p = getTimePartsByZone(new Date(), "Asia/Tokyo");
     const hour = p.hour;
     const minute = p.minute;
-    if (minute !== 0) return;
+    if (minute !== 31) return;
     if (hour !== 0 && hour !== 12) return;
     const key = `${p.year}-${pad2(p.month)}-${pad2(p.day)}-${hour}`;
     if (lastRunKey === key) return;
-    lastRunKey = key;
-    void runDailyRankingRefresh();
+    const jitterKey = `dailyRank|${key}`;
+    runAfterScheduledJitter(jitterKey, () => {
+      lastRunKey = key;
+      safeVoid(runDailyRankingRefresh(), "runDailyRankingRefresh");
+    });
   }, CHECK_MS);
 }
 
@@ -1915,17 +2576,19 @@ function startJpAutoUpdateTimers() {
     if (p.hour !== hour || p.minute !== minute) return;
     const key = `${p.year}-${pad2(p.month)}-${pad2(p.day)}-${keySuffix}`;
     if (lastRunKey === key) return;
-    lastRunKey = key;
-
-    void (async () => {
-      try {
-        await refreshCurrentUserLatest(true);
-        app.state.lastRankUpdateAt = new Date().toISOString();
-        app.state.lastDailyRefreshDate = getDateKeyJst(new Date());
-        saveState();
-        renderAll();
-      } catch (_) {}
-    })();
+    const jitterKey = `jpAuto|${key}`;
+    runAfterScheduledJitter(jitterKey, () => {
+      lastRunKey = key;
+      void (async () => {
+        try {
+          await refreshCurrentUserLatest(true);
+          app.state.lastRankUpdateAt = new Date().toISOString();
+          app.state.lastDailyRefreshDate = getDateKeyJst(new Date());
+          saveState();
+          renderAll();
+        } catch (_) {}
+      })();
+    });
   }
 
   setInterval(() => {
@@ -1933,7 +2596,7 @@ function startJpAutoUpdateTimers() {
     if (app.busyCounter > 0) return;
     // AM: 09:30 の約定相当だが Yahoo 許可は 09:45-10:15 → 09:55 で更新
     runIfNeededAt(9, 55, "09-55");
-    // PM: 15:33 の約定相当だが Yahoo 許可は 15:48-16:05 → 15:50 で更新
+    // PM: 16:00 終値約定想定。Yahoo 許可は 15:48-16:05 → 15:50 で更新（市場外は catch-up で補完）
     runIfNeededAt(15, 50, "15-50");
   }, CHECK_MS);
 }
@@ -1956,30 +2619,36 @@ function startUsAutoUpdateTimers() {
     if (p.hour === 10 && (p.minute === 5 || p.minute === 6)) {
       const key = `${p.year}-${pad2(p.month)}-${pad2(p.day)}-10-05`;
       if (lastRunKey !== key) {
-        lastRunKey = key;
-        void (async () => {
-          try {
-            await refreshCurrentUserLatest(true);
-            app.state.lastRankUpdateAt = new Date().toISOString();
-            saveState();
-            renderAll();
-          } catch (_) {}
-        })();
+        const jitterKey = `usAuto|${key}`;
+        runAfterScheduledJitter(jitterKey, () => {
+          lastRunKey = key;
+          void (async () => {
+            try {
+              await refreshCurrentUserLatest(true);
+              app.state.lastRankUpdateAt = new Date().toISOString();
+              saveState();
+              renderAll();
+            } catch (_) {}
+          })();
+        });
       }
     }
     // PM: 16:00 頃の約定相当 → 16:05
     if (p.hour === 16 && (p.minute === 5 || p.minute === 6)) {
       const key = `${p.year}-${pad2(p.month)}-${pad2(p.day)}-16-05`;
       if (lastRunKey !== key) {
-        lastRunKey = key;
-        void (async () => {
-          try {
-            await refreshCurrentUserLatest(true);
-            app.state.lastRankUpdateAt = new Date().toISOString();
-            saveState();
-            renderAll();
-          } catch (_) {}
-        })();
+        const jitterKey = `usAuto|${key}`;
+        runAfterScheduledJitter(jitterKey, () => {
+          lastRunKey = key;
+          void (async () => {
+            try {
+              await refreshCurrentUserLatest(true);
+              app.state.lastRankUpdateAt = new Date().toISOString();
+              saveState();
+              renderAll();
+            } catch (_) {}
+          })();
+        });
       }
     }
   }, CHECK_MS);
@@ -2003,30 +2672,36 @@ function startCryptoAutoUpdateTimers() {
     if (p.hour === 0 && (p.minute === 5 || p.minute === 6)) {
       const key = `${p.year}-${pad2(p.month)}-${pad2(p.day)}-00-05`;
       if (lastRunKey !== key) {
-        lastRunKey = key;
-        void (async () => {
-          try {
-            await refreshCurrentUserLatest(true);
-            app.state.lastRankUpdateAt = new Date().toISOString();
-            saveState();
-            renderAll();
-          } catch (_) {}
-        })();
+        const jitterKey = `cryptoAuto|${key}`;
+        runAfterScheduledJitter(jitterKey, () => {
+          lastRunKey = key;
+          void (async () => {
+            try {
+              await refreshCurrentUserLatest(true);
+              app.state.lastRankUpdateAt = new Date().toISOString();
+              saveState();
+              renderAll();
+            } catch (_) {}
+          })();
+        });
       }
     }
     // 12:00 の約定相当 → 12:05
     if (p.hour === 12 && (p.minute === 5 || p.minute === 6)) {
       const key = `${p.year}-${pad2(p.month)}-${pad2(p.day)}-12-05`;
       if (lastRunKey !== key) {
-        lastRunKey = key;
-        void (async () => {
-          try {
-            await refreshCurrentUserLatest(true);
-            app.state.lastRankUpdateAt = new Date().toISOString();
-            saveState();
-            renderAll();
-          } catch (_) {}
-        })();
+        const jitterKey = `cryptoAuto|${key}`;
+        runAfterScheduledJitter(jitterKey, () => {
+          lastRunKey = key;
+          void (async () => {
+            try {
+              await refreshCurrentUserLatest(true);
+              app.state.lastRankUpdateAt = new Date().toISOString();
+              saveState();
+              renderAll();
+            } catch (_) {}
+          })();
+        });
       }
     }
   }, CHECK_MS);
@@ -2040,7 +2715,11 @@ function startPendingAutoFixTimer() {
     if (app.busyCounter > 0) return;
     if (app.autoFixInFlight) return;
     app.autoFixInFlight = true;
-    void maybeAutoFixPendingPicks().finally(() => { app.autoFixInFlight = false; });
+    void maybeAutoFixPendingPicks()
+      .catch((e) => console.warn("[stockgame] maybeAutoFixPendingPicks", e))
+      .finally(() => {
+        app.autoFixInFlight = false;
+      });
   }, TICK_MS);
 }
 
@@ -2071,7 +2750,7 @@ async function maybeAutoFixPendingPicks() {
   const nowObj = new Date(now);
   const nowJst = getTimePartsByZone(nowObj, "Asia/Tokyo");
   const nowNy = getTimePartsByZone(nowObj, "America/New_York");
-  const afterJpPmWindow = nowJst.hour > 15 || (nowJst.hour === 15 && nowJst.minute >= 48);
+  const afterJpPmWindow = nowJst.hour > 16 || (nowJst.hour === 16 && nowJst.minute >= 5);
   const afterUsPmWindow = nowNy.hour > 16 || (nowNy.hour === 16 && nowNy.minute >= 5);
   const afterCryptoPmWindow = nowJst.hour > 12 || (nowJst.hour === 12 && nowJst.minute >= 5);
   const autoFix = app.state.security.autoFix;
@@ -2152,23 +2831,32 @@ async function maybeAutoFixPendingPicks() {
   const historyRowsBySymbol = {};
 
   for (const [symbol, picks] of picksBySymbol.entries()) {
-    const cached = app.state.apiCache.history[symbol];
-    if (cached?.rows?.length) {
-      historyRowsBySymbol[symbol] = cached.rows;
+    const mergedRows = historyRowsForSymbol(symbol);
+    if (mergedRows?.length) {
+      historyRowsBySymbol[symbol] = mergedRows;
       // 一度キャッシュで解決を試す
       for (const pick of picks) {
         // entry pending
         if (pick.entryPending || pick.entryPrice == null) {
           const entry = resolveFillByOrderDate(historyRowsBySymbol[symbol], pick.orderDate, pick.orderSlot, pick.market);
           const slotPassed = hasOrderSlotPassed(pick.orderDate, pick.orderSlot, pick.market, nowObj);
-          const marketClosedNow = isMarketClosedNow(pick.market, nowObj);
-          pick.entryPendingReason = entry.pending ? (slotPassed && !(marketClosedNow || pick.market === "CRYPTO") ? (entry.reason || "DATA_WAIT") : "SLOT_WAIT") : "";
+          pick.entryPendingReason = entry.pending ? (slotPassed ? (entry.reason || "DATA_WAIT") : "SLOT_WAIT") : "";
           if (!entry.pending && entry.price != null && slotPassed) {
             pick.entryPrice = entry.price;
             pick.entryDate = entry.date;
             pick.entryPending = false;
             pick.entrySettledAt = slotScheduledIso(pick.market, entry.date || pick.orderDate, pick.orderSlot);
             changed = true;
+          } else if (slotPassed && entry.pending) {
+            const loose = resolveFillByOrderDateLoose(historyRowsBySymbol[symbol], pick.orderDate, pick.orderSlot, pick.market);
+            if (!loose.pending && loose.price != null) {
+              pick.entryPrice = loose.price;
+              pick.entryDate = loose.date;
+              pick.entryPending = false;
+              pick.entryPendingReason = "";
+              pick.entrySettledAt = slotScheduledIso(pick.market, loose.date || pick.orderDate, pick.orderSlot);
+              changed = true;
+            }
           }
         } else {
           // entry は確定済みだが、過去データ矛盾で価格がズレている可能性を軽量監査
@@ -2282,10 +2970,21 @@ async function maybeAutoFixPendingPicks() {
       if (market === "CRYPTO") {
         forceNow = true;
       } else {
-        // 銘柄ごとの Yahoo 許可ウィンドウ外は、キャッシュ更新だけに留める（緊急以外での強制取得を避ける）
+        // 銘柄ごとの Yahoo 許可ウィンドウ外は通常スキップ。ただし約定スロット経過後に未約定が残り市場時間外なら1回だけ履歴取得で補完（夜間・休日の取りこぼし防止）
         const cacheHasHistory = Boolean(app.state.apiCache.history[symbol]?.rows?.length);
-        if (!isYahooAccessAllowed(symbol) && !cacheHasHistory) continue;
-        forceNow = isYahooAccessAllowed(symbol);
+        const catchUpSettlement = picks.some((p) => {
+          if (!p || p.status === "CLOSED") return false;
+          const entryDue =
+            (p.entryPending || p.entryPrice == null) &&
+            hasOrderSlotPassed(p.orderDate, p.orderSlot, p.market, nowObj);
+          const sellDue =
+            Boolean(p.sellPending && p.sellOrderDate) &&
+            hasOrderSlotPassed(p.sellOrderDate, p.sellOrderSlot, p.market, nowObj);
+          if (!entryDue && !sellDue) return false;
+          return p.market !== "CRYPTO" && isMarketClosedNow(p.market, nowObj);
+        });
+        if (!isYahooAccessAllowed(symbol) && !cacheHasHistory && !catchUpSettlement) continue;
+        forceNow = isYahooAccessAllowed(symbol) || Boolean(catchUpSettlement && !cacheHasHistory);
       }
 
       await fetchHistory(symbol, forceNow);
@@ -2297,15 +2996,23 @@ async function maybeAutoFixPendingPicks() {
         if (pick.entryPending || pick.entryPrice == null) {
           const entry = resolveFillByOrderDate(rows, pick.orderDate, pick.orderSlot, pick.market);
           const slotPassed = hasOrderSlotPassed(pick.orderDate, pick.orderSlot, pick.market, nowObj);
-          const marketClosedNow = isMarketClosedNow(pick.market, nowObj);
           pick.entryPendingReason = entry.pending
-            ? (slotPassed && !(marketClosedNow || pick.market === "CRYPTO") ? (entry.reason || "DATA_WAIT") : "SLOT_WAIT")
+            ? (slotPassed ? (entry.reason || "DATA_WAIT") : "SLOT_WAIT")
             : "";
           if (!entry.pending && entry.price != null && slotPassed) {
             pick.entryPrice = entry.price;
             pick.entryDate = entry.date;
             pick.entryPending = false;
             changed = true;
+          } else if (slotPassed && entry.pending) {
+            const loose = resolveFillByOrderDateLoose(rows, pick.orderDate, pick.orderSlot, pick.market);
+            if (!loose.pending && loose.price != null) {
+              pick.entryPrice = loose.price;
+              pick.entryDate = loose.date;
+              pick.entryPending = false;
+              pick.entryPendingReason = "";
+              changed = true;
+            }
           }
         }
         if (!pick.entrySettledAt && pick.entryPrice != null) {
@@ -2322,7 +3029,6 @@ async function maybeAutoFixPendingPicks() {
           pick.latestDate = latest.date;
           pick.latestResolvedAt = new Date().toISOString();
         }
-
         if (pick.sellPending && pick.sellOrderDate) {
           const exit = resolveFillByOrderDate(rows, pick.sellOrderDate, pick.sellOrderSlot, pick.market);
           const sellSlotPassed = hasOrderSlotPassed(pick.sellOrderDate, pick.sellOrderSlot, pick.market, nowObj);
@@ -2332,6 +3038,7 @@ async function maybeAutoFixPendingPicks() {
             pick.exitDate = exit.date;
             pick.status = "CLOSED";
             pick.sellPending = false;
+            pick.sellSettledAt = slotScheduledIso(pick.market, exit.date || pick.sellOrderDate, pick.sellOrderSlot);
             changed = true;
           }
         }
@@ -2352,25 +3059,40 @@ async function maybeAutoFixPendingPicks() {
 async function runDailyRankingRefresh() {
   try {
     await rollSeasonIfNeeded();
-    // 0:00/12:00 更新は「マイページ(自分)＋ランキング表示」用途。
+    // 0:31/12:31 JST 定時は「マイページ(自分)＋ランキング表示」（サーバ一括 0:30/12:30 直後の snapshot 取り込み）。
     // Yahoo への負荷を抑えるため、まずはキャッシュのみで全員分を再計算し、
     // 取得が必要な分だけ（基本は自分のみ）更新する。
     try {
       refreshUsersLatestCacheOnly(getActiveUsers());
     } catch (_) {}
 
-    // Supabase 利用時は他参加者のランキングはサーバー集計を取り込む（Yahoo へは行かない）
     if (getSupabaseCloudConfig()) {
+      try {
+        if (getSupabaseSessionToken()) {
+          await refreshCurrentUserLatest(true);
+          await flushCloudPushNow();
+        }
+      } catch (_) {}
+      try {
+        await triggerRemoteRankingRecomputeBestEffort();
+      } catch (e) {
+        console.warn("[stockgame] triggerRemoteRankingRecomputeBestEffort", e);
+      }
       try {
         await pullPublicRankingSnapshot("scheduled");
       } catch (_) {}
+      try {
+        if (getSupabaseSessionToken()) {
+          await refreshCurrentUserLatest(true);
+          await flushCloudPushNow();
+        }
+      } catch (_) {}
+    } else {
+      try {
+        await refreshCurrentUserLatest(true);
+      } catch (_) {}
     }
 
-    // 自分の保有銘柄の上昇率は 0:00/12:00 で更新したい（必要最小限の外部取得）
-    // ※これが Yahoo を叩く可能性はあるが、全ユーザーではなく「自分のみ」に限定する。
-    try {
-      await refreshCurrentUserLatest(true);
-    } catch (_) {}
     app.state.lastRankUpdateAt = new Date().toISOString();
     app.state.lastDailyRefreshDate = getDateKeyJst(new Date());
     saveState();
@@ -2382,7 +3104,7 @@ async function runDailyRankingRefresh() {
       renderAll();
     } catch (_) {}
     if (typeof showGlobalNotice === "function") {
-      showGlobalNotice("0時/12時の自動更新で一時的に取得に失敗しました。「最新の順位を見る」で再取得できます。", true);
+      showGlobalNotice("0時31分/12時31分の自動更新で一時的に取得に失敗しました。「最新の順位を見る」で再取得できます。", true);
     }
   }
 }
@@ -2478,6 +3200,7 @@ function getElements() {
     pickUnconfirmedNotice: byId("pickUnconfirmedNotice"),
     refreshMyPricesBtn: byId("refreshMyPricesBtn"),
     refreshRankBtn: byId("refreshRankBtn"),
+    rankRefreshProgress: byId("rankRefreshProgress"),
     refreshAccountPageBtn: byId("refreshAccountPageBtn"),
     accountLastUpdateLabel: byId("accountLastUpdateLabel"),
     rankLastUpdateLabel: byId("rankLastUpdateLabel"),
@@ -2510,11 +3233,11 @@ function getElements() {
 }
 
 function wireEvents() {
-  app.els.menuRankingBtn.addEventListener("click", onMenuRanking);
+  app.els.menuRankingBtn.addEventListener("click", () => safeVoid(onMenuRanking(), "onMenuRanking"));
   app.els.menuLoginBtn.addEventListener("click", onMenuLogin);
   app.els.menuRegisterBtn.addEventListener("click", onMenuRegister);
   app.els.menuPickBtn.addEventListener("click", onMenuPick);
-  app.els.topLogoutBtn.addEventListener("click", onLogout);
+  app.els.topLogoutBtn.addEventListener("click", () => safeVoid(onLogout(), "onLogout"));
   if (app.els.menuCopySyncUrlBtn) app.els.menuCopySyncUrlBtn.addEventListener("click", onCopySyncUrlClick);
   app.els.authForm.addEventListener("submit", onAuthSubmit);
   app.els.switchAuthModeBtn.addEventListener("click", onSwitchAuthMode);
@@ -2531,7 +3254,7 @@ function wireEvents() {
   if (app.els.resetNewPassword && app.els.resetNewPasswordToggle) bindPasswordToggle(app.els.resetNewPassword, app.els.resetNewPasswordToggle);
   app.els.renameForm.addEventListener("submit", onRenameSubmit);
   app.els.changePasswordForm.addEventListener("submit", onChangePasswordSubmit);
-  app.els.logoutBtn.addEventListener("click", onLogout);
+  app.els.logoutBtn.addEventListener("click", () => safeVoid(onLogout(), "onLogout"));
   if (app.els.deleteAccountBtn) app.els.deleteAccountBtn.addEventListener("click", onDeleteAccountClick);
   app.els.toggleRenameBtn.addEventListener("click", () => toggleAccountForm("rename"));
   app.els.togglePasswordBtn.addEventListener("click", () => toggleAccountForm("password"));
@@ -2546,8 +3269,8 @@ function wireEvents() {
     app.symbolSuggestFreezeUntilEdit = false;
     app.symbolSuggestFreezeBaseline = "";
     const mt = app.els.marketType.value;
-    if (mt === "JP" || mt === "AUTO") void loadJpCompanyMaster();
-    void updateSymbolSuggestions();
+    if (mt === "JP" || mt === "AUTO") safeVoid(loadJpCompanyMaster(), "loadJpCompanyMaster");
+    safeVoid(updateSymbolSuggestions(), "updateSymbolSuggestions");
     renderAll();
   });
   app.els.symbolInput.addEventListener("input", () => {
@@ -2556,10 +3279,13 @@ function wireEvents() {
     onSymbolInputInput();
   });
   app.els.symbolInput.addEventListener("focus", () => {
-    void (async () => {
-      await loadJpCompanyMaster();
-      void updateSymbolSuggestions();
-    })();
+    safeVoid(
+      (async () => {
+        await loadJpCompanyMaster();
+        await updateSymbolSuggestions();
+      })(),
+      "symbolInputFocusSuggest"
+    );
   });
   app.els.symbolInput.addEventListener("keydown", onSymbolInputKeydown);
   app.els.symbolSuggestList.addEventListener("click", onSymbolSuggestClick);
@@ -2567,20 +3293,23 @@ function wireEvents() {
   if (app.els.resetRecoveryQuestion) app.els.resetRecoveryQuestion.addEventListener("change", syncRecoveryAnswerHints);
   syncRecoveryAnswerHints();
   app.els.refreshMyPricesBtn.addEventListener("click", () => {
-    void onRefreshMyPrices();
+    safeVoid(onRefreshMyPrices(), "onRefreshMyPrices");
   });
   app.els.refreshRankBtn.addEventListener("click", () => {
-    void runWithButtonBusy(app.els.refreshRankBtn, "更新中...", async () => {
-      await onRefreshSeason();
-    });
+    safeVoid(
+      runWithButtonBusy(app.els.refreshRankBtn, "更新中...", async () => {
+        await onRefreshSeason();
+      }),
+      "onRefreshSeason"
+    );
   });
   if (app.els.refreshAccountPageBtn) {
     app.els.refreshAccountPageBtn.addEventListener("click", () => {
-      void onRefreshFromAccountPage();
+      safeVoid(onRefreshFromAccountPage(), "onRefreshFromAccountPage");
     });
   }
   app.els.apiDiagBtn.addEventListener("click", () => {
-    void onApiDiagClick();
+    safeVoid(onApiDiagClick(), "onApiDiagClick");
   });
   app.els.pickTableBody.addEventListener("click", onPickTableAction);
   app.els.reportTableBody.addEventListener("click", onReportTableAction);
@@ -2661,7 +3390,7 @@ function wireEvents() {
       if (btn instanceof HTMLButtonElement) {
         e.preventDefault();
         e.stopPropagation();
-        void runReportReasonClick(btn.getAttribute("data-reason") || "その他");
+        safeVoid(runReportReasonClick(btn.getAttribute("data-reason") || "その他"), "runReportReasonClick");
       }
     });
   }
@@ -2670,7 +3399,7 @@ function wireEvents() {
     if (btn instanceof HTMLButtonElement && app.els.reportReasonModal && !app.els.reportReasonModal.classList.contains("hidden")) {
       e.preventDefault();
       e.stopPropagation();
-      void runReportReasonClick(btn.getAttribute("data-reason") || "その他");
+      safeVoid(runReportReasonClick(btn.getAttribute("data-reason") || "その他"), "runReportReasonClick");
     }
   }, true);
 
@@ -2767,10 +3496,16 @@ function getHintChipDisplayName(symbol) {
   return symbolPresetMap.get(symbol)?.name || symbolPresetMap.get(symbol + ".T")?.name || symbolPresetMap.get(symbol + "-USD")?.name || symbol;
 }
 
-function onMenuRanking() {
+async function onMenuRanking() {
   if (!confirmLeavePickView("ranking")) return;
   setCurrentView("ranking");
   renderAll();
+  if (getSupabaseCloudConfig()) {
+    try {
+      await pullPublicRankingSnapshot("rankingTab");
+      renderAll();
+    } catch (_) {}
+  }
 }
 
 function onMenuLogin() {
@@ -2794,7 +3529,7 @@ function onMenuRegister() {
   syncAuthMode("register");
   setCurrentView("auth");
   renderAll();
-  void refreshCloudAccountRegistrationStats();
+  safeVoid(refreshCloudAccountRegistrationStats(), "refreshCloudAccountRegistrationStats");
 }
 
 function onMenuPick() {
@@ -2822,24 +3557,43 @@ function clonePicksForDraft(picks) {
  * 触って元に戻した場合は最後に確定した状態と一致し、未確定扱いにしない。
  */
 function buildPicksStructuralHash(picks) {
-  const arr = (picks || []).slice().sort((a, b) => String(a.id).localeCompare(String(b.id)));
+  const arr = Array.isArray(picks) ? picks.slice() : [];
+  arr.sort((a, b) => String((a && a.id) || "").localeCompare(String((b && b.id) || "")));
   return JSON.stringify(
-    arr.map((p) => [
-      p.id,
-      p.symbol,
-      p.market,
-      p.status,
-      p.orderDate,
-      p.orderSlot,
-      p.entryPrice,
-      p.entryDate,
-      p.entryPending ? 1 : 0,
-      p.sellPending ? 1 : 0,
-      p.sellOrderDate,
-      p.sellOrderSlot,
-      p.exitPrice,
-      p.exitDate
-    ])
+    arr
+      .filter((p) => p && typeof p === "object")
+      .map((p) => [
+        p.id,
+        p.symbol,
+        p.market,
+        p.status,
+        p.orderDate,
+        p.orderSlot,
+        p.entryPrice,
+        p.entryDate,
+        p.entryPending ? 1 : 0,
+        p.sellPending ? 1 : 0,
+        p.sellOrderDate,
+        p.sellOrderSlot,
+        p.exitPrice,
+        p.exitDate
+      ])
+  );
+}
+
+/** id・銘柄・市場・CLOSED のみ（価格・約定フラグは除外）。揺らぎで未確定扱いになってもランキング銘柄を落とさないため */
+function buildPicksIdentityHash(picks) {
+  const arr = Array.isArray(picks) ? picks.slice() : [];
+  arr.sort((a, b) => String((a && a.id) || "").localeCompare(String((b && b.id) || "")));
+  return JSON.stringify(
+    arr
+      .filter((p) => p && typeof p === "object")
+      .map((p) => [
+        p.id,
+        String(p.symbol || "").toUpperCase(),
+        p.market,
+        p.status
+      ])
   );
 }
 
@@ -2866,10 +3620,39 @@ function syncPickConfirmFlagsIfPicksMatchLastConfirmed(user) {
  */
 function getPicksForRankingSnapshot(user) {
   if (!user) return [];
-  if (hasUncommittedPickChanges(user) && Array.isArray(user.picksLastConfirmed)) {
-    return user.picksLastConfirmed;
+  const picks = Array.isArray(user.picks) ? user.picks : [];
+  const plc = Array.isArray(user.picksLastConfirmed) ? user.picksLastConfirmed : [];
+  if (!hasUncommittedPickChanges(user)) return picks;
+  /*
+   * 構造ハッシュは entryPrice / latestPrice 等でもズレる → 未確定扱いのまま picksLastConfirmed だけ見ると
+   * 片方にしかいない銘柄（例: 日本株）がランキングから消える。銘柄本体が同じなら常に picks を正とする。
+   */
+  if (buildPicksIdentityHash(picks) === buildPicksIdentityHash(plc)) return picks;
+  /* 確定が空で picks にオープンがある: データ不整合。ランキングから銘柄を消さない */
+  if (!plc.length && picks.length) return picks;
+  const snapOpen = countOpenNonClosedPicks(plc);
+  const liveOpen = countOpenNonClosedPicks(picks);
+  if (snapOpen === 0 && liveOpen > 0) return picks;
+  /* 編集中 picks のオープンが多い＝確定側が古く欠けている（同期ずれ） */
+  if (liveOpen > snapOpen) return picks;
+  return plc.length ? plc : picks;
+}
+
+function countOpenNonClosedPicks(arr) {
+  if (!Array.isArray(arr)) return 0;
+  return arr.filter((p) => p && p.status !== "CLOSED").length;
+}
+
+/** 注記「銘柄未登録」誤表示防止: 確定が空でも編集中 picks にオープンがあればカウントする */
+function effectiveOpenPickCountForRankingNote(user) {
+  if (!user) return 0;
+  const snap = getPicksForRankingSnapshot(user);
+  const nSnap = countOpenNonClosedPicks(snap);
+  if (nSnap >= 1) return nSnap;
+  if (hasUncommittedPickChanges(user)) {
+    return countOpenNonClosedPicks(user.picks);
   }
-  return user.picks || [];
+  return nSnap;
 }
 
 /** 同一 id の銘柄について、確定スナップショットへ最新価格・約定進捗（売却状態は除く）を反映 */
@@ -3029,6 +3812,15 @@ function applyCurrentView() {
 }
 
 function renderAll() {
+  try {
+    renderAllImpl();
+  } catch (err) {
+    console.error("[stockgame] renderAll", err);
+    notifyUnexpectedErrorToUser("renderAll", err);
+  }
+}
+
+function renderAllImpl() {
   const now = new Date();
   const season = getSeasonKeyJst(now);
   const user = getCurrentUser();
@@ -3053,8 +3845,19 @@ function renderAll() {
   renderHistoryTable();
   syncRankTableMenuColumnVisibility();
   if (app.els.rankLastUpdateLabel) {
-    const at = app.state.lastRankUpdateAt;
+    const pubAt = app.state.publicRankingSnapshotAt;
+    const usePub = Boolean(getSupabaseCloudConfig() && pubAt);
+    const at = usePub ? pubAt : app.state.lastRankUpdateAt;
     const d = app.state.lastDailyRefreshDate;
+    const snapId = String(app._publicRankingSnapshotId || "").trim();
+    const fresh = String(app._liveRankDataFreshness || "").trim();
+    let title = "";
+    if (getSupabaseCloudConfig()) {
+      const parts = [];
+      if (snapId) parts.push(`snapshot: ${snapId}`);
+      if (fresh) parts.push(`source: ${fresh}`);
+      title = parts.join(" · ");
+    }
     if (at) {
       try {
         app.els.rankLastUpdateLabel.textContent = `最終更新: ${formatDateTimeJst(at)}`;
@@ -3066,6 +3869,8 @@ function renderAll() {
         ? `最終更新: ${d.slice(0, 4)}年${Number(d.slice(5, 7))}月${Number(d.slice(8, 10))}日`
         : "";
     }
+    if (title) app.els.rankLastUpdateLabel.title = title;
+    else app.els.rankLastUpdateLabel.removeAttribute("title");
   }
   updateActionAvailability();
   applyCurrentView();
@@ -3120,11 +3925,22 @@ function renderMonthlyResult(user) {
     block.innerHTML = `<p class="monthly-result-label">今月のリターン</p><p class="monthly-result-value monthly-result-none">${noneInner}</p>`;
     return;
   }
-  const pctClass = score.returnPct > 0 ? "pct-up" : score.returnPct < 0 ? "pct-down" : "pct-flat";
+  const rp = score.returnPct;
+  const hasPct = rp != null && Number.isFinite(Number(rp));
+  const pctClass = !hasPct
+    ? "monthly-result-none"
+    : rp > 0
+      ? "pct-up"
+      : rp < 0
+        ? "pct-down"
+        : "pct-flat";
+  const metaLine = hasPct
+    ? `<p class="monthly-result-meta">${score.validPickCount}銘柄で算出</p>`
+    : `<p class="monthly-result-meta">約定済みで評価できる銘柄がまだありません（買注のみは平均に含みません）。</p>`;
   block.innerHTML = `
     <p class="monthly-result-label">今月のリターン</p>
-    <p class="monthly-result-value ${pctClass}">${formatPct(score.returnPct)}</p>
-    <p class="monthly-result-meta">${score.validPickCount}銘柄で算出</p>`;
+    <p class="monthly-result-value ${pctClass}">${formatPct(rp)}</p>
+    ${metaLine}`;
 }
 
 function renderPickTable() {
@@ -3155,27 +3971,34 @@ function renderPickTable() {
     const pct = computePickPct(pick);
     const pctClass = pct == null ? "pct-flat" : pct > 0 ? "pct-up" : pct < 0 ? "pct-down" : "pct-flat";
     const statusHtml = formatPickStatusCellHtml(pick);
+    const uiEntryPending = isPickEntryEffectivelyPending(pick);
+    const effEntry = resolveEffectiveEntryPriceForLatestScore(pick, null, new Date());
     const statusClass = pick.status === "CLOSED"
       ? "status-closed"
       : pick.sellPending
         ? "status-sell-wait"
-        : pick.entryPending
+        : uiEntryPending
           ? "status-entry-wait"
           : "status-holding";
     const entryText =
-      pick.entryPrice != null
-        ? formatPriceDateStackHtml(pick.entryPrice, pick.market, pick.entryDate, null)
-        : escapeHtml("約定待ち");
-    const latestRefPrice = pick.status === "CLOSED" ? pick.exitPrice : pick.latestPrice;
-    const latestRefDate = pick.status === "CLOSED" ? pick.exitDate : pick.latestDate;
+      effEntry != null && effEntry.price != null && effEntry.price > 0
+        ? formatPriceDateStackHtml(effEntry.price, pick.market, effEntry.date, null)
+        : pick.entryPrice != null
+          ? formatPriceDateStackHtml(pick.entryPrice, pick.market, pick.entryDate, null)
+          : escapeHtml("約定待ち");
+    const latestRefPrice =
+      pick.status === "CLOSED" ? pick.exitPrice : (pick.latestPrice != null ? pick.latestPrice : quotePriceForSymbol(pick.symbol));
+    const latestRefDate =
+      pick.status === "CLOSED"
+        ? pick.exitDate
+        : (pick.latestPrice != null ? pick.latestDate : quoteAsOfDateKeyForSymbol(pick.symbol));
     const latestText =
       latestRefPrice != null
         ? formatPriceDateStackHtml(latestRefPrice, pick.market, latestRefDate, null)
         : `<span class="price-line-primary">-</span>`;
-    const canSell = !pick.entryPending && pick.status !== "CLOSED";
-    // 売却予約中は削除不可（取消は「売却取消」のみ。未約定買いのみ削除可）
-    // 「約定しているのに entryPending が残る」などの矛盾があっても削除できないようにする
-    const canRemove = Boolean(pick.entryPending && pick.entryPrice == null && !pick.sellPending && pick.status !== "CLOSED");
+    const canSell = !uiEntryPending && pick.status !== "CLOSED";
+    // 売却予約中は削除不可（取消は「売却取消」のみ。実質「買い注文中」のみ削除可）
+    const canRemove = Boolean(uiEntryPending && !pick.sellPending && pick.status !== "CLOSED");
     const pickIdSafe = escapeHtml(pick.id);
     const sellBtn = pick.sellPending
       ? `<button class="tiny-btn" data-action="cancelSell" data-pick-id="${pickIdSafe}" type="button">売却取消</button>`
@@ -3214,7 +4037,7 @@ function renderPickConfirmState() {
   }
 
   const openPicks = (user.picks || []).filter((p) => p.status !== "CLOSED");
-  const pendingCount = openPicks.filter((p) => p.entryPending).length;
+  const pendingCount = openPicks.filter((p) => isPickEntryEffectivelyPending(p)).length;
   if (pendingCount > 0) {
     app.els.pickConfirmState.textContent = `買い注文中: ${pendingCount}銘柄が約定待ちです。`;
     return;
@@ -3257,7 +4080,7 @@ function pickStatusLabel(pick) {
     const reason = pick.sellPendingReason ? `（${getPendingReasonLabel(pick.sellPendingReason)}）` : "";
     return "売り注文中" + reason;
   }
-  if (pick.entryPending) {
+  if (isPickEntryEffectivelyPending(pick)) {
     const reason = pick.entryPendingReason ? `（${getPendingReasonLabel(pick.entryPendingReason)}）` : "";
     return "買い注文中" + reason;
   }
@@ -3280,7 +4103,7 @@ function formatPriceDateStackHtml(price, market, date, pendingLabel) {
 /** 状態セル: 「買い注文中」と「（市場時間待ち）」を改行（銘柄選択・マイ取引） */
 function formatPickStatusCellHtml(pick) {
   const longNote =
-    pick.entryPending && isLongPending(pick.orderDate)
+    isPickEntryEffectivelyPending(pick) && isLongPending(pick.orderDate)
       ? ' <small class="section-note">（3日以上未約定）</small>'
       : pick.sellPending && pick.sellOrderDate && isLongPending(pick.sellOrderDate)
         ? ' <small class="section-note">（3日以上未約定）</small>'
@@ -3296,7 +4119,7 @@ function formatPickStatusCellHtml(pick) {
       : "";
     return `<span class="status-stack">${main}${sub}</span>${longNote}`;
   }
-  if (pick.entryPending) {
+  if (isPickEntryEffectivelyPending(pick)) {
     const reason = pick.entryPendingReason ? getPendingReasonLabel(pick.entryPendingReason) : "";
     const main = escapeHtml("買い注文中");
     const sub = reason
@@ -3338,22 +4161,39 @@ function renderMyTradeReport() {
       pick.status === "CLOSED"
         ? escapeHtml(pick.exitDate || "-")
         : formatPickStatusCellHtml(pick);
-    const entryPriceText = pick.entryPrice != null ? formatPrice(pick.entryPrice, pick.market) : "約定待ち";
+    const effEntryOpen =
+      pick.status !== "CLOSED" ? resolveEffectiveEntryPriceForLatestScore(pick, null, new Date()) : null;
+    const entryPriceNum =
+      pick.entryPrice != null
+        ? pick.entryPrice
+        : effEntryOpen != null && effEntryOpen.price != null && effEntryOpen.price > 0
+          ? effEntryOpen.price
+          : null;
+    const entryPriceText = entryPriceNum != null ? formatPrice(entryPriceNum, pick.market) : "約定待ち";
+    const buyDateDisplay =
+      pick.entryDate ||
+      (effEntryOpen != null && effEntryOpen.date ? effEntryOpen.date : null) ||
+      pick.orderDate ||
+      "-";
+    const latestRefPriceOpen =
+      pick.latestPrice != null ? pick.latestPrice : quotePriceForSymbol(pick.symbol);
+    const latestRefDateOpen =
+      pick.latestPrice != null ? pick.latestDate : quoteAsOfDateKeyForSymbol(pick.symbol);
     const currentOrExitPriceHtml =
       pick.status === "CLOSED"
         ? (pick.exitPrice != null
           ? formatPriceDateStackHtml(pick.exitPrice, pick.market, pick.exitDate, null)
           : `<span class="price-line-primary">-</span>`)
-        : (pick.latestPrice != null
-          ? formatPriceDateStackHtml(pick.latestPrice, pick.market, pick.latestDate, null)
-          : `<span class="price-line-primary">-</span>`);
+        : latestRefPriceOpen != null
+          ? formatPriceDateStackHtml(latestRefPriceOpen, pick.market, latestRefDateOpen, null)
+          : `<span class="price-line-primary">-</span>`;
     const symbolDisplayName = resolvePickDisplayName(pick);
     const symEsc = escapeHtml(pick.symbol || "");
     const mktEsc = escapeHtml(marketLabel(pick.market));
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td class="my-report-symbol-cell" data-label="銘柄"><span class="my-report-symbol-name" title="${escapeHtml(symbolDisplayName)}">${escapeHtml(symbolDisplayName)}</span><small class="pick-symbol-line"><span class="pick-symbol-code">${symEsc}</span><span class="pick-market-inline"> ${mktEsc}</span></small></td>
-      <td data-label="買付日">${escapeHtml(pick.entryDate || pick.orderDate || "-")}</td>
+      <td data-label="買付日">${escapeHtml(buyDateDisplay)}</td>
       <td class="price-cell-num my-report-price-num" data-label="取得単価">${escapeHtml(entryPriceText)}</td>
       <td class="price-cell-num my-report-price-num" data-label="現在・売却価格">${currentOrExitPriceHtml}</td>
       <td data-label="状態／売却日">${statusOrSellDateHtml}</td>
@@ -3375,8 +4215,8 @@ function getTop10TitleEmoji(rank) {
     case 6: return "🔥";
     case 7: return "🎯";
     case 8: return "🛡️";
-    case 9: return "🧠";
-    case 10: return "🌱";
+    case 9: return "";
+    case 10: return "";
     default: return "";
   }
 }
@@ -3484,11 +4324,15 @@ function renderLiveRanking() {
     const accountHtml = row.isAnonymized
       ? renderAnonymousRankLabel(row.displayName, false)
       : escapeHtml(row.displayName);
-    const tradesCell = row.trades.length
-      ? renderTradeDetails(row.trades)
+    const tradesArr = Array.isArray(row.trades) ? row.trades : [];
+    const symRowLen = Array.isArray(row.symbols) ? row.symbols.length : 0;
+    const fallbackNote =
+      symRowLen > 0 && !tradesArr.length ? "集計待ち" : "未取引・未確定";
+    const tradesCell = tradesArr.length
+      ? renderTradeDetails(tradesArr)
       : row.pendingOrderCount != null && row.pendingOrderCount > 0
         ? `<span class="rank-note rank-note--stacked"><span class="rank-note__line1">注文中</span><span class="rank-note__line2">${escapeHtml(`（${row.pendingOrderCount}銘柄が約定待ち）`)}</span></span>`
-        : `<span class="rank-note">${escapeHtml(row.note || "未取引・未確定")}</span>`;
+        : `<span class="rank-note">${escapeHtml(row.note || fallbackNote)}</span>`;
     const menuCell = renderRankMenuCell(row, season, currentUser);
     const rankBadge = displayRank ? renderRankBadge(displayRank) : "";
     const accountLenClass = rankAccountCellLenClass(row.displayName);
@@ -3825,7 +4669,7 @@ async function onRegisterConfirmOk() {
       // 公開ランキングスナップショットを即取り込み、他参加者の順位もすぐ表示できるようにする。
       if (getSupabaseCloudConfig()) {
         try {
-          await pullPublicRankingSnapshot("boot");
+          await pullPublicRankingSnapshot("register");
         } catch (_) {}
       }
     });
@@ -3870,7 +4714,7 @@ function closeIntroModal() {
     syncAuthMode("register");
   }
   renderAll();
-  if (app.authMode === "register") void refreshCloudAccountRegistrationStats();
+  if (app.authMode === "register") safeVoid(refreshCloudAccountRegistrationStats(), "refreshCloudAccountRegistrationStats");
 }
 
 function onSwitchAuthMode() {
@@ -3884,7 +4728,7 @@ function onSwitchAuthMode() {
   }
   syncAuthMode(app.authMode === "register" ? "login" : "register");
   renderAll();
-  if (app.authMode === "register") void refreshCloudAccountRegistrationStats();
+  if (app.authMode === "register") safeVoid(refreshCloudAccountRegistrationStats(), "refreshCloudAccountRegistrationStats");
 }
 
 function onToggleResetForm() {
@@ -4251,6 +5095,7 @@ function onDownloadReportClick() {
 }
 
 async function onLogout() {
+  app._cloudGameStateUpdatedAt = "";
   const user = getCurrentUser();
   if (user && hasUncommittedPickChanges(user)) {
     const ok = confirm(
@@ -4271,6 +5116,11 @@ async function onLogout() {
   clearMessage(app.els.pickMessage);
   clearMessage(app.els.reportMessage);
   showPreview(null);
+  if (getSupabaseCloudConfig()) {
+    try {
+      await pullPublicRankingSnapshot("logout");
+    } catch (_) {}
+  }
   renderAll();
 }
 
@@ -4347,8 +5197,13 @@ async function onDeleteAccountClick() {
     : "この端末の表示データを消去してログアウトしました。サーバー側の削除に失敗した場合、同じIDで再登録できないことがあります。Supabase に delete-account 関数をデプロイするか、ダッシュボードでユーザーを削除してください。";
   showPreview(null);
   setCurrentView("ranking");
+  if (getSupabaseCloudConfig()) {
+    try {
+      await pullPublicRankingSnapshot("accountDeleted");
+    } catch (_) {}
+  }
   renderAll();
-  if (getSupabaseCloudConfig()) void refreshCloudAccountRegistrationStats();
+  if (getSupabaseCloudConfig()) safeVoid(refreshCloudAccountRegistrationStats(), "refreshCloudAccountRegistrationStats");
   showGlobalNotice(doneMsg, !serverDeleted);
 }
 
@@ -4716,6 +5571,88 @@ async function runWithButtonBusy(button, busyText, task) {
   }
 }
 
+function loadRankRefreshLimitState() {
+  const today = getDateKeyJst(new Date());
+  try {
+    const raw = localStorage.getItem(RANK_REFRESH_LS_KEY);
+    if (!raw) return { lastSuccessAt: 0, dayKey: today, dayCount: 0 };
+    const s = JSON.parse(raw);
+    let dayKey = String(s.dayKey || "");
+    let dayCount = Number(s.dayCount) || 0;
+    if (dayKey !== today) {
+      dayKey = today;
+      dayCount = 0;
+    }
+    return {
+      lastSuccessAt: Number.isFinite(Number(s.lastSuccessAt)) ? Number(s.lastSuccessAt) : 0,
+      dayKey,
+      dayCount
+    };
+  } catch (_) {
+    return { lastSuccessAt: 0, dayKey: today, dayCount: 0 };
+  }
+}
+
+function saveRankRefreshLimitState(state) {
+  try {
+    localStorage.setItem(RANK_REFRESH_LS_KEY, JSON.stringify(state));
+  } catch (_) {
+    /* ignore */
+  }
+}
+
+/** @returns {string|null} 拒否理由メッセージ。null なら実行可 */
+function getRankRefreshBlockMessage() {
+  const esc = getEscalationBlockMessage();
+  if (esc) return esc;
+  const now = Date.now();
+  const today = getDateKeyJst(new Date());
+  const s = loadRankRefreshLimitState();
+  const maxDay = Math.max(1, Math.floor(Number(CONFIG.rankRefreshMaxPerDay)) || 2);
+  const minIv = Math.max(0, Number(CONFIG.rankRefreshMinIntervalMs) || 12 * 60 * 60 * 1000);
+  let dayCount = s.dayCount;
+  let dayKey = s.dayKey;
+  if (dayKey !== today) {
+    dayKey = today;
+    dayCount = 0;
+  }
+  if (dayCount >= maxDay) {
+    return `「最新の順位を見る」は1日に${maxDay}回までです（日本時間）。日付が変わってから再度お試しください。`;
+  }
+  if (s.lastSuccessAt > 0 && now - s.lastSuccessAt < minIv) {
+    const remain = minIv - (now - s.lastSuccessAt);
+    const sec = Math.max(1, Math.ceil(remain / 1000));
+    const h = Math.floor(sec / 3600);
+    const m = Math.max(0, Math.ceil((sec - h * 3600) / 60));
+    const needH = Math.max(1, Math.round(minIv / (60 * 60 * 1000)));
+    if (h >= 1 && m > 0) {
+      return `「最新の順位を見る」は前回から約${needH}時間以上あけてご利用ください。あと約${h}時間${m}分後に再度お試しください。`;
+    }
+    if (h >= 1) {
+      return `「最新の順位を見る」は前回から約${needH}時間以上あけてご利用ください。あと約${h}時間後に再度お試しください。`;
+    }
+    const mShow = Math.max(1, m);
+    return `「最新の順位を見る」は前回から約${needH}時間以上あけてご利用ください。あと約${mShow}分後に再度お試しください。`;
+  }
+  return null;
+}
+
+function recordRankRefreshSuccess() {
+  const today = getDateKeyJst(new Date());
+  const s = loadRankRefreshLimitState();
+  let dayKey = s.dayKey;
+  let dayCount = s.dayCount;
+  if (dayKey !== today) {
+    dayKey = today;
+    dayCount = 0;
+  }
+  saveRankRefreshLimitState({
+    lastSuccessAt: Date.now(),
+    dayKey,
+    dayCount: dayCount + 1
+  });
+}
+
 async function onRefreshMyPrices() {
   clearMessage(app.els.pickMessage);
   const user = getCurrentUser();
@@ -4745,6 +5682,7 @@ async function onRefreshMyPrices() {
     });
     app.state.lastDailyRefreshDate = getDateKeyJst(new Date());
     saveState();
+    await flushCloudPushNow();
     setMessage(app.els.pickMessage, "銘柄の現在値を更新しました。", false);
     renderAll();
   } catch (error) {
@@ -4756,29 +5694,11 @@ async function onRefreshMyPrices() {
 
 async function onRefreshSeason() {
   if (app.submitLocks?.has("refreshSeason")) return;
-  const rankR = checkAndRecordClientRateLimitWithEscalation(
-    "rankBulkRefresh",
-    CONFIG.clientRateRankMax,
-    CONFIG.clientRateRankWindowMs
-  );
-  if (!rankR.ok) {
-    const w = Math.ceil(CONFIG.clientRateRankWindowMs / 1000);
-    if (rankR.kind === "escalation") {
-      showGlobalNotice(rankR.message, true);
-      clearMessage(app.els.pickMessage);
-      setMessage(app.els.pickMessage, rankR.message, true);
-    } else {
-      showGlobalNotice(
-        `順位の一括更新は負荷が大きいため制限しています。約${rankR.retryAfterSec}秒後に再度お試しください。（${w}秒間に${CONFIG.clientRateRankMax}回まで）※繰り返し連打すると制限が強くなります。`,
-        true
-      );
-      clearMessage(app.els.pickMessage);
-      setMessage(
-        app.els.pickMessage,
-        `「最新の順位を見る」は短時間に繰り返さないでください。約${rankR.retryAfterSec}秒後に再度お試しください。※繰り返し連打すると制限が強くなります。`,
-        true
-      );
-    }
+  const rankBlock = getRankRefreshBlockMessage();
+  if (rankBlock) {
+    showGlobalNotice(rankBlock, true);
+    clearMessage(app.els.pickMessage);
+    setMessage(app.els.pickMessage, rankBlock, true);
     return;
   }
   return guardedSubmit("refreshSeason", async () => {
@@ -4786,18 +5706,36 @@ async function onRefreshSeason() {
     showGlobalNotice("銘柄の現在値を更新しています...", false);
     try {
       setBusy(true);
+      app.rankBulkYahooMinGapActive = true;
       await rollSeasonIfNeeded();
-      await refreshAllUsersLatest(true);
+      await refreshAllUsersLatest(true, {
+        onProgress: (pct, meta) => {
+          const el = app.els.rankRefreshProgress;
+          if (!el || !meta || meta.total < 2) return;
+          el.textContent = `${pct}%`;
+        }
+      });
+      recordRankRefreshSuccess();
       app.state.lastDailyRefreshDate = getDateKeyJst(new Date());
       app.state.lastRankUpdateAt = new Date().toISOString();
       saveState();
+      await flushCloudPushNow();
       renderAll();
       showGlobalNotice("", false);
+      if (getSupabaseCloudConfig() && !getSupabaseSessionToken()) {
+        setMessage(
+          app.els.pickMessage,
+          "このブラウザ上の表示のみ更新されました。クラウドの全員向けランキングに反映するにはログインのうえで実行してください。",
+          false
+        );
+      }
     } catch (error) {
       captureApiFailure(error, "", "history");
       showGlobalNotice(normalizeErrorMessage(error), true);
       renderApiDiagMessage();
     } finally {
+      app.rankBulkYahooMinGapActive = false;
+      if (app.els.rankRefreshProgress) app.els.rankRefreshProgress.textContent = "";
       setBusy(false);
     }
   });
@@ -4840,6 +5778,7 @@ async function onRefreshFromAccountPage() {
     app.state.lastDailyRefreshDate = getDateKeyJst(new Date());
     app.state.lastRankUpdateAt = new Date().toISOString();
     saveState();
+    await flushCloudPushNow();
     if (app.els.accountMessage) setMessage(app.els.accountMessage, "保有銘柄とランキングを更新しました。", false);
     renderAll();
   } catch (error) {
@@ -4945,7 +5884,7 @@ async function onPickTableAction(event) {
   if (action === "remove") {
     const pick = (user.picks || []).find((p) => p.id === pickId);
     if (pick && pick.status === "CLOSED") return;
-    if (pick && !pick.entryPending && !pick.sellPending) {
+    if (pick && !isPickEntryEffectivelyPending(pick) && !pick.sellPending) {
       setMessage(app.els.pickMessage, "保有中は削除できません。", true);
       return;
     }
@@ -5112,7 +6051,7 @@ function onLiveRankBodyClick(event) {
         } catch (error) {
           showGlobalNotice(error instanceof Error ? error.message : "解除に失敗しました。", true);
         }
-      })();
+      })().catch((e) => console.warn("[stockgame] unreport-rank", e));
     }
     return;
   }
@@ -5316,6 +6255,11 @@ async function loadJpCompanyMaster() {
     if (!Array.isArray(data) || data.length === 0) return;
     app.jpCompanyMaster = data;
     app.jpSuggestEngine = window.StockgameJpAutocomplete.createEngine(data);
+    if (typeof renderAll === "function" && app.els) {
+      try {
+        renderAll();
+      } catch (_) {}
+    }
   } catch (_) {
     app.jpCompanyMaster = null;
     app.jpSuggestEngine = null;
@@ -5343,7 +6287,7 @@ function onSymbolInputInput() {
     app.symbolSuggestFreezeBaseline = "";
     app.els.marketType.value = "AUTO";
     app.addPickBtnJustAdded = false;
-    void updateSymbolSuggestions();
+    safeVoid(updateSymbolSuggestions(), "updateSymbolSuggestions");
     if (app.lastPreview?.symbol) setChartLinkContext(app.lastPreview.symbol, app.lastPreview.market);
     else clearChartLinkContext();
     renderAll();
@@ -5354,7 +6298,7 @@ function onSymbolInputInput() {
     clearTimeout(app.symbolSuggestTimer);
   }
   app.symbolSuggestTimer = window.setTimeout(() => {
-    void updateSymbolSuggestions();
+    safeVoid(updateSymbolSuggestions(), "updateSymbolSuggestions");
   }, getSymbolSuggestDebounceMs());
 }
 
@@ -5611,15 +6555,37 @@ function renderTradeDetailsBlock(safeTrades) {
   }
   const n = safeTrades.length;
   const listItems = safeTrades.map((t) => {
-    const name = getSymbolDisplayName(t.symbol);
-    const entryStr = t.entryPrice != null ? formatPrice(t.entryPrice, t.market) : "-";
-    const exitStr = t.exitPrice != null ? formatPrice(t.exitPrice, t.market) : (t.exitDate && t.exitDate !== "-" ? t.exitDate : "保有");
-    const pctClass = t.returnPct > 0 ? "pct-up" : t.returnPct < 0 ? "pct-down" : "pct-flat";
+    const name = displayNameForPublicRankingSymbol(
+      t.symbol,
+      typeof t.market === "string" ? t.market : ""
+    );
+    const incomplete = t.rankTradeIncomplete === true;
+    const entryStr =
+      t.entryPrice != null && Number.isFinite(Number(t.entryPrice))
+        ? formatPrice(t.entryPrice, t.market)
+        : "—";
+    const exitStr = incomplete
+      ? "—"
+      : t.exitPrice != null
+        ? formatPrice(t.exitPrice, t.market)
+        : t.exitDate && t.exitDate !== "-"
+          ? t.exitDate
+          : "保有";
+    const pctRaw = incomplete ? null : t.returnPct;
+    const pctNum = pctRaw != null ? Number(pctRaw) : NaN;
+    const pctStr = Number.isFinite(pctNum) ? formatPct(pctNum) : "—";
+    const pctClass = !Number.isFinite(pctNum)
+      ? "pct-flat"
+      : pctNum > 0
+        ? "pct-up"
+        : pctNum < 0
+          ? "pct-down"
+          : "pct-flat";
     return `<li class="rank-trade-inline-item">
       <span class="rank-trade-line rank-trade-line--name"><span class="rank-trade-name">${escapeHtml(name)}</span></span>
       <span class="rank-trade-line rank-trade-line--kv">購入：${escapeHtml(entryStr)}</span>
       <span class="rank-trade-line rank-trade-line--kv">現在/売却：${escapeHtml(exitStr)}</span>
-      <span class="rank-trade-line rank-trade-line--pct ${pctClass}">${escapeHtml(formatPct(t.returnPct))}</span>
+      <span class="rank-trade-line rank-trade-line--pct ${pctClass}">${escapeHtml(pctStr)}</span>
     </li>`;
   }).join("");
   return `
@@ -5664,7 +6630,10 @@ function buildReportStats() {
   }
   return [...targetMap.values()]
     .filter((x) => x.count > 0)
-    .sort((a, b) => b.count - a.count || a.displayName.localeCompare(b.displayName, "ja"));
+    .sort(
+      (a, b) =>
+        b.count - a.count || String(a.displayName || "").localeCompare(String(b.displayName || ""), "ja")
+    );
 }
 
 function isOlderThanHours(isoString, hours) {
@@ -5678,7 +6647,11 @@ function canReport(reporter) {
   if (!reporter) return false;
   if (!isOlderThanHours(reporter.createdAt, 24)) return false;
   const snap = getPicksForRankingSnapshot(reporter);
-  const hasConfirmedPick = snap.some((p) => !p.entryPending && p.entryPrice != null);
+  const hasConfirmedPick = snap.some((p) => {
+    if (p.status === "CLOSED") return false;
+    const ep = toFiniteNumber(p.entryPrice);
+    return ep != null && ep > 0;
+  });
   return hasConfirmedPick;
 }
 
@@ -5828,7 +6801,7 @@ function purgeUserCompletely(userId) {
     app.sessionUserId = null;
     app.state.sessionUserId = null;
     clearSupabaseSessionToken();
-    if (supaTokenSnap) void notifySupabaseLogoutBestEffort(supaTokenSnap);
+    if (supaTokenSnap) safeVoid(notifySupabaseLogoutBestEffort(supaTokenSnap), "notifySupabaseLogoutBestEffort");
     app.pickUndoStack = [];
     if (typeof showPreview === "function") showPreview(null);
   }
@@ -6173,13 +7146,18 @@ async function registerAccount(name, password, recoveryQuestionId, recoveryAnswe
       throw new Error("サーバーからの登録応答が不正です。");
     }
     setSupabaseSessionToken(data.sessionToken);
+    if (typeof data.serverUpdatedAt === "string" && data.serverUpdatedAt.trim()) {
+      app._cloudGameStateUpdatedAt = data.serverUpdatedAt.trim();
+    } else {
+      app._cloudGameStateUpdatedAt = "";
+    }
     app.state = normalizeState(data.state);
     app.sessionUserId = data.user.id;
     app.state.sessionUserId = data.user.id;
     recordRegistration();
     recordDeviceRegistration();
     saveState();
-    void refreshCloudAccountRegistrationStats();
+    safeVoid(refreshCloudAccountRegistrationStats(), "refreshCloudAccountRegistrationStats");
     return;
   }
 
@@ -6257,10 +7235,24 @@ async function loginAccount(name, password) {
       normalized.currentSeason = seasonNow;
     }
     setSupabaseSessionToken(data.sessionToken);
+    if (typeof data.serverUpdatedAt === "string" && data.serverUpdatedAt.trim()) {
+      app._cloudGameStateUpdatedAt = data.serverUpdatedAt.trim();
+    } else {
+      app._cloudGameStateUpdatedAt = "";
+    }
     clearFailedLogin(key);
     app.state = normalized;
     app.sessionUserId = data.user.id;
     app.state.sessionUserId = data.user.id;
+    saveState();
+    /**
+     * login の state はサーバー行に保存されていたユーザーリストのみのことが多い。
+     * 登録直後と同様、公開 ranking-snapshot をすぐマージしないと他参加者が消えたように見える。
+     * （visible は 3 分スロットルで、直前の boot 直後はしばらく再取得されない。）
+     */
+    try {
+      await pullPublicRankingSnapshot("login");
+    } catch (_) {}
     saveState();
     return;
   }
@@ -6388,11 +7380,49 @@ async function addPickToCurrentUser(resolved) {
   let rows = app.state.apiCache.history[resolved.symbol]?.rows || null;
   let quoteData = null;
 
-  try {
-    quoteData = await fetchQuote(resolved.symbol, false);
-    app.lastApiFailure = null;
-  } catch (error) {
-    captureApiFailure(error, resolved.symbol, "quote");
+  if (resolved.market !== "CRYPTO") {
+    await tryHydrateSharedMarketHistoryOne(resolved.symbol);
+    rows = app.state.apiCache.history[resolved.symbol]?.rows || rows;
+  }
+
+  const nowPick = new Date();
+  if (resolved.market !== "CRYPTO") {
+    const histEntry = app.state.apiCache.history[resolved.symbol];
+    const histRows = histEntry?.rows;
+    const histOk =
+      histEntry &&
+      Array.isArray(histRows) &&
+      histRows.length &&
+      Date.now() - histEntry.ts < CONFIG.historyTtlMs;
+    const mClosed = isMarketClosedNow(resolved.market, nowPick);
+    const yahooAllowed = isYahooAccessAllowed(resolved.symbol);
+    if (histOk && (mClosed || !yahooAllowed)) {
+      const latest = getLatestFromRows(histRows);
+      if (latest?.price != null) {
+        const synth = {
+          symbol: resolved.symbol,
+          name:
+            pickBestDisplayName(resolved.symbol, resolved.market, null, resolved.nameGuess) ||
+            (resolved.symbol && /\.T$/i.test(resolved.symbol) ? getJpDisplayName(resolved.symbol) : null) ||
+            symbolPresetMap.get(resolved.symbol)?.name ||
+            resolved.symbol,
+          price: latest.price,
+          asOfMs: closeAsOfMsForMarket(resolved.market, latest.date) || Date.now()
+        };
+        cacheQuoteData(resolved.symbol, synth, histEntry.ts);
+        quoteData = synth;
+        app.lastApiFailure = null;
+      }
+    }
+  }
+
+  if (!quoteData) {
+    try {
+      quoteData = await fetchQuote(resolved.symbol, false);
+      app.lastApiFailure = null;
+    } catch (error) {
+      captureApiFailure(error, resolved.symbol, "quote");
+    }
   }
 
   if (!rows?.length && !quoteData?.price) {
@@ -6411,7 +7441,6 @@ async function addPickToCurrentUser(resolved) {
 
   const entry = rows?.length ? resolveFillByOrderDate(rows, orderDate, orderSlot, resolved.market) : { price: null, date: null, pending: true };
   const slotPassed = hasOrderSlotPassed(orderDate, orderSlot, resolved.market);
-  const marketClosedNow = isMarketClosedNow(resolved.market, new Date());
   let entryStillPending = entry.pending || !slotPassed;
   let latest = rows?.length ? getLatestFromRows(rows) : null;
   if (quoteData?.price != null) {
@@ -6431,7 +7460,7 @@ async function addPickToCurrentUser(resolved) {
     app.lastApiFailure = null;
   }
 
-  const entryPriceFinal = entryStillPending ? null : (entry.price ?? latest?.price);
+  const entryPriceFinal = entryStillPending ? null : (entry.price != null ? entry.price : null);
   const entryDateFinal = entryStillPending ? null : (entry.date ?? orderDate);
 
   const displayName =
@@ -6450,9 +7479,8 @@ async function addPickToCurrentUser(resolved) {
     entryPrice: entryPriceFinal,
     entryDate: entryDateFinal,
     entryPending: entryStillPending,
-    // 市場時間外（JP/US）は、slotPassed が偶然 true でも「価格データ待ち」表示にせず統一する
     entryPendingReason: entryStillPending
-      ? (!slotPassed || marketClosedNow || resolved.market === "CRYPTO" ? "SLOT_WAIT" : (entry.reason || "DATA_WAIT"))
+      ? (slotPassed ? (entry.reason || "DATA_WAIT") : "SLOT_WAIT")
       : "",
     latestPrice: latest?.price ?? null,
     latestDate: latest?.date ?? null,
@@ -6480,7 +7508,10 @@ async function sellPickForCurrentUser(pickId) {
   const pick = (user.picks || []).find((x) => x.id === pickId);
   if (!pick) throw new Error("銘柄が見つかりません。");
   if (pick.status === "CLOSED") throw new Error("この銘柄はすでに売却済みです。");
-  if (pick.entryPending) throw new Error("注文が確定するまで売却できません。");
+  {
+    const ep = toFiniteNumber(pick.entryPrice);
+    if (ep == null || ep <= 0) throw new Error("注文が確定するまで売却できません。");
+  }
 
   const season = app?.state?.currentSeason || getSeasonKeyJst(new Date());
   const alreadyCountedThisMonth = seasonFromDateKey(pick.sellOrderDate) === season;
@@ -6520,19 +7551,26 @@ async function sellPickForCurrentUser(pickId) {
   saveState();
 }
 
-async function refreshCurrentUserLatest(force) {
+async function refreshCurrentUserLatest(force, options = {}) {
   const user = getCurrentUser();
   if (!user) return;
-  await refreshUsersLatest([user], force);
+  await refreshUsersLatest([user], force, options);
   saveState();
 }
 
-async function refreshAllUsersLatest(force) {
-  await refreshUsersLatest(getActiveUsers(), force);
+async function refreshAllUsersLatest(force, options = {}) {
+  await refreshUsersLatest(getActiveUsers(), force, options);
   saveState();
 }
 
-async function refreshUsersLatest(users, force) {
+async function refreshUsersLatest(users, force, options = {}) {
+  const onProgress = typeof options.onProgress === "function" ? options.onProgress : null;
+  /**
+   * force=true は「対象銘柄の集合（未クローズのみ等）」にだけ使い、Yahoo 履歴の強制取得は opt-in。
+   * 既定では fetchHistory(..., false) とし、TTL・isYahooAccessAllowed・キャッシュで Yahoo を抑える。
+   * どうしても履歴を強制取得したい場合のみ options.forceYahooHistory === true を付与する。
+   */
+  const historyForce = Boolean(force && options.forceYahooHistory === true);
   const nowIso = new Date().toISOString();
   const nowObj = new Date();
   const symbols = new Set();
@@ -6549,36 +7587,72 @@ async function refreshUsersLatest(users, force) {
       });
     });
   }
-  if (!symbols.size) return;
+  if (!symbols.size) {
+    onProgress?.(100, { total: 0, completed: 0 });
+    return;
+  }
+
+  const symbolList = [...symbols];
+  const total = symbolList.length;
+  let completed = 0;
+  const bumpProgress = () => {
+    completed += 1;
+    const pct = total ? Math.min(100, Math.round((completed / total) * 100)) : 100;
+    onProgress?.(pct, { total, completed });
+  };
+
+  onProgress?.(0, { total, completed: 0 });
+
+  await hydrateSharedMarketHistoryBatch(symbolList);
 
   const rowsMap = new Map();
-  for (const symbol of symbols) {
-    try {
-      const history = await fetchHistory(symbol, force);
-      rowsMap.set(symbol, history.rows);
-    } catch (error) {
-      const cached = app.state.apiCache.history[symbol];
-      if (cached?.rows?.length) rowsMap.set(symbol, cached.rows);
-    }
+  const parallel = Math.max(
+    1,
+    Math.min(16, Math.floor(Number(CONFIG.historyRefreshParallelism)) || 8)
+  );
+  for (let i = 0; i < symbolList.length; i += parallel) {
+    const batch = symbolList.slice(i, i + parallel);
+    await Promise.all(
+      batch.map(async (symbol) => {
+        try {
+          const history = await fetchHistory(symbol, historyForce);
+          rowsMap.set(symbol, history.rows);
+        } catch (error) {
+          const cached = app.state.apiCache.history[symbol];
+          if (cached?.rows?.length) rowsMap.set(symbol, cached.rows);
+        } finally {
+          bumpProgress();
+        }
+      })
+    );
   }
 
   for (const user of users) {
     for (const pick of user.picks || []) {
-      const rows = rowsMap.get(pick.symbol);
+      let rows = rowsMap.get(pick.symbol);
+      if (!rows?.length) rows = historyRowsForSymbol(pick.symbol);
       if (!rows || !rows.length) continue;
 
       if (pick.entryPending || pick.entryPrice == null) {
         const entry = resolveFillByOrderDate(rows, pick.orderDate, pick.orderSlot, pick.market);
         const slotPassed = hasOrderSlotPassed(pick.orderDate, pick.orderSlot, pick.market, nowObj);
-        const marketClosedNow = isMarketClosedNow(pick.market, nowObj);
         pick.entryPendingReason = entry.pending
-          ? (slotPassed && !(marketClosedNow || pick.market === "CRYPTO") ? (entry.reason || "DATA_WAIT") : "SLOT_WAIT")
+          ? (slotPassed ? (entry.reason || "DATA_WAIT") : "SLOT_WAIT")
           : "";
         if (!entry.pending && entry.price != null && slotPassed) {
           pick.entryPrice = entry.price;
           pick.entryDate = entry.date;
           pick.entryPending = false;
           pick.entrySettledAt = slotScheduledIso(pick.market, entry.date || pick.orderDate, pick.orderSlot);
+        } else if (slotPassed && entry.pending) {
+          const loose = resolveFillByOrderDateLoose(rows, pick.orderDate, pick.orderSlot, pick.market);
+          if (!loose.pending && loose.price != null) {
+            pick.entryPrice = loose.price;
+            pick.entryDate = loose.date;
+            pick.entryPending = false;
+            pick.entryPendingReason = "";
+            pick.entrySettledAt = slotScheduledIso(pick.market, loose.date || pick.orderDate, pick.orderSlot);
+          }
         }
       } else if (!pick.entrySettledAt && pick.entryPrice != null) {
         // 既に約定済みだが、旧データで約定時刻だけ欠けている場合の補完
@@ -6594,7 +7668,6 @@ async function refreshUsersLatest(users, force) {
         pick.latestDate = latest.date;
         pick.latestResolvedAt = nowIso;
       }
-
       if (pick.sellPending && pick.sellOrderDate) {
         const exit = resolveFillByOrderDate(rows, pick.sellOrderDate, pick.sellOrderSlot, pick.market);
         const sellSlotPassed = hasOrderSlotPassed(pick.sellOrderDate, pick.sellOrderSlot, pick.market, nowObj);
@@ -6620,7 +7693,7 @@ async function refreshUsersLatest(users, force) {
   }
 }
 
-/** キャッシュのみでランキングを再計算（Yahoo にアクセスしない）。12:00/24:00 自動更新用 */
+/** キャッシュのみでランキングを再計算（Yahoo にアクセスしない）。0:31/12:31 JST 定時更新の前処理用 */
 function refreshUsersLatestCacheOnly(users) {
   const nowIso = new Date().toISOString();
   const nowObj = new Date();
@@ -6631,25 +7704,34 @@ function refreshUsersLatestCacheOnly(users) {
   }));
   const rowsMap = new Map();
   for (const symbol of symbols) {
-    const cached = app.state.apiCache.history[symbol];
-    if (cached?.rows?.length) rowsMap.set(symbol, cached.rows);
+    const merged = historyRowsForSymbol(symbol);
+    if (merged?.length) rowsMap.set(symbol, merged);
   }
   for (const user of users) {
     for (const pick of user.picks || []) {
-      const rows = rowsMap.get(pick.symbol);
+      let rows = rowsMap.get(pick.symbol);
+      if (!rows?.length) rows = historyRowsForSymbol(pick.symbol);
       if (!rows || !rows.length) continue;
       if (pick.entryPending || pick.entryPrice == null) {
         const entry = resolveFillByOrderDate(rows, pick.orderDate, pick.orderSlot, pick.market);
         const slotPassed = hasOrderSlotPassed(pick.orderDate, pick.orderSlot, pick.market, nowObj);
-        const marketClosedNow = isMarketClosedNow(pick.market, nowObj);
         pick.entryPendingReason = entry.pending
-          ? (slotPassed && !(marketClosedNow || pick.market === "CRYPTO") ? (entry.reason || "DATA_WAIT") : "SLOT_WAIT")
+          ? (slotPassed ? (entry.reason || "DATA_WAIT") : "SLOT_WAIT")
           : "";
         if (!entry.pending && entry.price != null && slotPassed) {
           pick.entryPrice = entry.price;
           pick.entryDate = entry.date;
           pick.entryPending = false;
           pick.entrySettledAt = slotScheduledIso(pick.market, entry.date || pick.orderDate, pick.orderSlot);
+        } else if (slotPassed && entry.pending) {
+          const loose = resolveFillByOrderDateLoose(rows, pick.orderDate, pick.orderSlot, pick.market);
+          if (!loose.pending && loose.price != null) {
+            pick.entryPrice = loose.price;
+            pick.entryDate = loose.date;
+            pick.entryPending = false;
+            pick.entryPendingReason = "";
+            pick.entrySettledAt = slotScheduledIso(pick.market, loose.date || pick.orderDate, pick.orderSlot);
+          }
         }
       } else if (!pick.entrySettledAt && pick.entryPrice != null) {
         const slotPassed = hasOrderSlotPassed(pick.orderDate, pick.orderSlot, pick.market);
@@ -6698,15 +7780,11 @@ function getPendingReasonLabel(reason) {
 function computeSellPendingReasonForDisplay(pick, exit, nowObj) {
   if (!pick.sellPending || !pick.sellOrderDate) return "";
   const slotPassed = hasOrderSlotPassed(pick.sellOrderDate, pick.sellOrderSlot, pick.market, nowObj);
-  const marketClosedNow = isMarketClosedNow(pick.market, nowObj);
-  // 価格は解決済みだが、売却スロット前 → 買い注文と同様に市場時間待ち
   if (!exit.pending && exit.price != null && !slotPassed) {
     return "SLOT_WAIT";
   }
   if (exit.pending) {
-    return slotPassed && !(marketClosedNow || pick.market === "CRYPTO")
-      ? (exit.reason || "DATA_WAIT")
-      : "SLOT_WAIT";
+    return slotPassed ? (exit.reason || "DATA_WAIT") : "SLOT_WAIT";
   }
   return "";
 }
@@ -6742,14 +7820,37 @@ function joinRankHoldingsHtmlChunks(chunks) {
 }
 
 /**
+ * 取得単価が有効なのに entryPending が true のまま残る不整合（マージ・旧データ）をランキング表示では「約定済み」扱いにする。
+ * 取得単価は履歴 slot のみ（resolveEffectiveEntryPriceForLatestScore）。仮約定はしない。
+ */
+function isPickEntryEffectivelyPending(pick) {
+  if (!pick || pick.status === "CLOSED") return false;
+  const ep = toFiniteNumber(pick.entryPrice);
+  if (ep != null && ep > 0) return false;
+  const r = resolveEffectiveEntryPriceForLatestScore(pick, null, new Date());
+  if (r != null && r.price != null && r.price > 0) return false;
+  // entryPending が false でも取得単価なしは買注（表示と取引行を一致させる）
+  return true;
+}
+
+/**
  * ランキング「保有銘柄」列用: 約定済み保有に加え、注文中・売却予約中も銘柄名＋ラベルで並べる。
  * 並び: 保有（約定済み・売却予約中含む）を左から → 未約定の買注をその後ろ。
- * row.symbols 用の heldSymbols は従来どおり「確定保有」のみ（スコア・保存データとの整合）。
+ * heldSymbols: スコア算出と整合する「約定済み・売却予約以外の実質保有」のコードのみ。
+ * allRankingSymbols: 表示列と同じ並びのオープン銘柄コード（買注・売注含む・重複除く）。サーバー displaySymbols と対応。
  */
 function formatLiveRankingHoldingsLine(user) {
-  const open = getPicksForRankingSnapshot(user).filter((p) => p.status !== "CLOSED");
-  const heldOrder = open.filter((p) => !p.entryPending);
-  const buyPendingOrder = open.filter((p) => p.entryPending);
+  let pickSource = getPicksForRankingSnapshot(user);
+  if (
+    hasUncommittedPickChanges(user) &&
+    countOpenNonClosedPicks(pickSource) === 0 &&
+    countOpenNonClosedPicks(user.picks) > 0
+  ) {
+    pickSource = user.picks || [];
+  }
+  const open = pickSource.filter((p) => p.status !== "CLOSED");
+  const heldOrder = open.filter((p) => !isPickEntryEffectivelyPending(p));
+  const buyPendingOrder = open.filter((p) => isPickEntryEffectivelyPending(p));
   const ordered = [...heldOrder, ...buyPendingOrder];
   const parts = [];
   const htmlParts = [];
@@ -6759,7 +7860,7 @@ function formatLiveRankingHoldingsLine(user) {
     const sep = isLast ? "" : "、";
     const name = resolvePickDisplayName(p);
     const safeName = escapeHtml(String(name));
-    if (p.entryPending) {
+    if (isPickEntryEffectivelyPending(p)) {
       parts.push(`${name}（買注）`);
       htmlParts.push(
         `<span class="rank-holding-pending"><span class="rank-symbol-name">${safeName}</span><span class="rank-order-note">（買注）</span>${sep}</span>`
@@ -6776,23 +7877,278 @@ function formatLiveRankingHoldingsLine(user) {
   }
   const symbolsText = parts.length ? parts.join("、") : "-";
   const symbolsHtml = htmlParts.length ? joinRankHoldingsHtmlChunks(htmlParts) : "-";
-  const heldPicks = open.filter((p) => !p.entryPending && !p.sellPending);
+  const heldPicks = open.filter((p) => !isPickEntryEffectivelyPending(p) && !p.sellPending);
   const heldSymbols = heldPicks.map((p) => p.symbol);
-  return { symbolsText, symbolsHtml, heldSymbols };
+  const allRankingSymbols = [];
+  const symSeen = new Set();
+  for (const p of ordered) {
+    const u = String(p.symbol || "").toUpperCase().trim();
+    if (!u || symSeen.has(u)) continue;
+    symSeen.add(u);
+    allRankingSymbols.push(p.symbol);
+  }
+  return { symbolsText, symbolsHtml, heldSymbols, allRankingSymbols };
+}
+
+
+/**
+ * 公開ランキング用: サーバー行は銘柄コードのみのことがあるため、trade の market・quote キャッシュ・銘柄マスタで社名に寄せる。
+ */
+function displayNameForPublicRankingSymbol(rawSymbol, marketHint) {
+  const sym = String(rawSymbol || "").trim();
+  if (!sym) return "";
+  const mkt =
+    marketHint === "JP" || marketHint === "US" || marketHint === "CRYPTO"
+      ? marketHint
+      : inferMarketFromKnownSymbol(sym);
+  let qn = "";
+  try {
+    const qc = app?.state?.apiCache?.quote?.[sym]?.data;
+    if (qc && qc.name != null) qn = String(qc.name).trim();
+  } catch (_) {}
+  const jpGuess = getJpDisplayName(sym) || getJpDisplayName(sym.replace(/\.T$/i, ""));
+  const best = pickBestDisplayName(sym, mkt, qn, jpGuess);
+  if (best && best !== sym) return best;
+  const fb = getSymbolDisplayName(sym);
+  if (fb && fb !== sym) return fb;
+  return best || sym;
+}
+
+/** ranking-snapshot の authoritative 行向け「保有銘柄」表示（コード連結をやめて社名化・買注/売注タグ） */
+function formatAuthoritativeRankingHoldingsLine(auth) {
+  const syms = Array.isArray(auth.symbols) ? auth.symbols.filter(Boolean) : [];
+  const buySet = new Set(
+    (Array.isArray(auth.buyPendingSymbols) ? auth.buyPendingSymbols : [])
+      .map((s) => String(s || "").toUpperCase().trim())
+      .filter(Boolean)
+  );
+  const sellSet = new Set(
+    (Array.isArray(auth.sellPendingSymbols) ? auth.sellPendingSymbols : [])
+      .map((s) => String(s || "").toUpperCase().trim())
+      .filter(Boolean)
+  );
+  const trades = Array.isArray(auth.trades) ? auth.trades : [];
+  const marketBySym = new Map();
+  for (const t of trades) {
+    if (!t || typeof t !== "object") continue;
+    const s = String(t.symbol || "").trim();
+    if (!s) continue;
+    const u = s.toUpperCase();
+    if (marketBySym.has(u)) continue;
+    const mk = typeof t.market === "string" ? t.market : "";
+    marketBySym.set(u, mk);
+  }
+  const parts = [];
+  const htmlParts = [];
+  for (let i = 0; i < syms.length; i += 1) {
+    const rawSym = syms[i];
+    const sU = String(rawSym).toUpperCase();
+    const mktHint = marketBySym.get(sU) || "";
+    const name = displayNameForPublicRankingSymbol(rawSym, mktHint);
+    const isLast = i === syms.length - 1;
+    const sep = isLast ? "" : "、";
+    const safeName = escapeHtml(String(name));
+    if (buySet.has(sU)) {
+      parts.push(`${name}（買注）`);
+      htmlParts.push(
+        `<span class="rank-holding-pending"><span class="rank-symbol-name">${safeName}</span><span class="rank-order-note">（買注）</span>${sep}</span>`
+      );
+    } else if (sellSet.has(sU)) {
+      parts.push(`${name}（売注）`);
+      htmlParts.push(
+        `<span class="rank-holding-pending"><span class="rank-symbol-name">${safeName}</span><span class="rank-order-note">（売注）</span>${sep}</span>`
+      );
+    } else {
+      parts.push(String(name));
+      htmlParts.push(safeName + sep);
+    }
+  }
+  const symbolsText = parts.length ? parts.join("、") : "-";
+  const symbolsHtml = htmlParts.length ? joinRankHoldingsHtmlChunks(htmlParts) : "-";
+  return { symbolsText, symbolsHtml };
+}
+
+/**
+ * ライブランキング並び:
+ * 0 = 取引行ありかつ上昇率あり（本番の順位付け）
+ * 1 = 注文中 or 集計待ち（中帯）
+ * 2 = 未取引・未確定・銘柄未登録等（最下位へ。hasScore だけあって取引行が空の 0.00% 表示もここ）
+ */
+function liveRankingSortTier(row) {
+  const trades = Array.isArray(row.trades) ? row.trades : [];
+  const symLen = Array.isArray(row.symbols) ? row.symbols.length : 0;
+  const pending = row.pendingOrderCount != null && row.pendingOrderCount > 0;
+  const note = String(row.note || "");
+  if (pending) return 1;
+  if (note === "集計待ち") return 1;
+  const hasPct = row.hasScore && row.returnPct != null && Number.isFinite(Number(row.returnPct));
+  if (trades.length > 0 && hasPct) return 0;
+  if (trades.length > 0 && !hasPct) return 1;
+  if (symLen > 0 && !hasPct && trades.length === 0) return 1;
+  return 2;
+}
+
+function compareLiveRankingRows(a, b) {
+  const ta = liveRankingSortTier(a);
+  const tb = liveRankingSortTier(b);
+  if (ta !== tb) return ta - tb;
+  if (ta === 0 && tb === 0) {
+    const diff = (b.returnPct || 0) - (a.returnPct || 0);
+    if (Math.abs(diff) > 1e-9) return diff;
+    if (b.validPickCount !== a.validPickCount) return b.validPickCount - a.validPickCount;
+  }
+  return String(a.displayName || "").localeCompare(String(b.displayName || ""), "ja");
 }
 
 function buildLiveRanking() {
   const season = app.state.currentSeason || getSeasonKeyJst(new Date());
+  const authSeason = app._authoritativeLiveSeason;
+  const authList = app._authoritativeLiveRows;
+
+  if (getSupabaseCloudConfig() && Array.isArray(authList) && authList.length > 0 && authSeason === season) {
+    const rows = [];
+    for (const auth of authList) {
+      if (!auth || typeof auth !== "object" || typeof auth.userId !== "string" || !auth.userId) continue;
+      const authOpenPc = Math.max(0, Math.floor(Number(auth.openPendingCount) || 0));
+      const serverNote = typeof auth.rankNote === "string" ? auth.rankNote : "";
+      const syms = Array.isArray(auth.symbols) ? auth.symbols.filter(Boolean) : [];
+      const { symbolsText: symJoin, symbolsHtml: symHtml } = formatAuthoritativeRankingHoldingsLine(auth);
+      let symbolsText = symJoin;
+      let symbolsHtml = symHtml;
+      let rowSyms = syms;
+      const localUser = (app.state.users || []).find((x) => x && x.id === auth.userId);
+      const authSymU = new Set(syms.map((s) => String(s || "").toUpperCase().trim()).filter(Boolean));
+      let serverMissingLocalPick = false;
+      if (localUser) {
+        const localSnapTrust = getPicksForRankingSnapshot(localUser);
+        const localOpenSyms = new Set();
+        for (const p of localSnapTrust) {
+          if (p && p.status !== "CLOSED") {
+            const u = String(p.symbol || "").toUpperCase().trim();
+            if (u) localOpenSyms.add(u);
+          }
+        }
+        /*
+         * ranking_entries が古く任天堂など欠けたまま（Meta のみ等）でも、同一端末の state には
+         * picks が残っている。logged-in 表示ではローカル銘柄を優先して欠損を見せない。
+         */
+        serverMissingLocalPick =
+          localOpenSyms.size > 0 &&
+          (syms.length === 0 || [...localOpenSyms].some((s) => !authSymU.has(s)));
+      }
+      if (serverMissingLocalPick) {
+        const lf = formatLiveRankingHoldingsLine(localUser);
+        symbolsText = lf.symbolsText;
+        symbolsHtml = lf.symbolsHtml;
+        rowSyms = lf.allRankingSymbols && lf.allRankingSymbols.length ? lf.allRankingSymbols : lf.heldSymbols;
+      }
+
+      /*
+       * ranking_entries が picks に追いついていないとき、保有列だけローカルに差し替えると
+       * 取引・％がサーバーの古い行のまま残り表示が壊れる。混在をやめ、取引・スコアもローカルで再計算する。
+       */
+      if (serverMissingLocalPick && localUser) {
+        const score = calcUserScore(localUser, "latest", season);
+        const rowBase = {
+          userId: auth.userId,
+          displayName: String(auth.displayName || ""),
+          isAnonymized: Boolean(auth.isAnonymized),
+          symbols: rowSyms,
+          symbolsText,
+          symbolsHtml
+        };
+        if (!score) {
+          const snap = getPicksForRankingSnapshot(localUser);
+          const openPicks = snap.filter((p) => p.status !== "CLOSED").length;
+          const openPending = snap.filter((p) => p.status !== "CLOSED" && isPickEntryEffectivelyPending(p)).length;
+          const hasUnconfirmed = hasUncommittedPickChanges(localUser);
+          rows.push({
+            ...rowBase,
+            returnPct: null,
+            validPickCount: 0,
+            trades: [],
+            winTrades: [],
+            hasScore: false,
+            pendingOrderCount: !hasUnconfirmed && openPending > 0 ? openPending : null,
+            note: hasUnconfirmed
+              ? (effectiveOpenPickCountForRankingNote(localUser) >= 1
+                ? (CONFIG.minPicks > 0 ? `${CONFIG.minPicks}銘柄以上で確定してください` : "銘柄を確定してください")
+                : "銘柄未登録")
+              : (openPending > 0
+                ? ""
+                : (openPicks >= 1 ? "集計待ち" : "銘柄未登録"))
+          });
+          continue;
+        }
+        const hasRankPct = score.returnPct != null && Number.isFinite(Number(score.returnPct));
+        if (!hasRankPct) {
+          rows.push({
+            ...rowBase,
+            returnPct: null,
+            validPickCount: Number.isFinite(Number(score.validPickCount))
+              ? Math.max(0, Math.floor(Number(score.validPickCount)))
+              : 0,
+            trades: score.trades,
+            winTrades: score.winTrades || [],
+            hasScore: false,
+            pendingOrderCount: null,
+            note: ""
+          });
+          continue;
+        }
+        rows.push({
+          ...rowBase,
+          returnPct: score.returnPct,
+          validPickCount: score.validPickCount,
+          trades: score.trades,
+          winTrades: score.winTrades,
+          hasScore: true,
+          pendingOrderCount: null,
+          note: ""
+        });
+        continue;
+      }
+
+      const hasScore = Boolean(auth.hasScore) && toFiniteNumber(auth.returnPct) != null;
+      const rp = toFiniteNumber(auth.returnPct);
+      let pendingOrderCount = null;
+      let note = "";
+      if (!hasScore) {
+        if (authOpenPc > 0) pendingOrderCount = authOpenPc;
+        if (serverNote) note = serverNote;
+      }
+      rows.push({
+        userId: auth.userId,
+        displayName: String(auth.displayName || ""),
+        isAnonymized: Boolean(auth.isAnonymized),
+        returnPct: hasScore ? rp : null,
+        validPickCount: Number.isFinite(Number(auth.validPickCount))
+          ? Math.max(0, Math.floor(Number(auth.validPickCount)))
+          : 0,
+        symbols: rowSyms,
+        symbolsText,
+        symbolsHtml,
+        trades: Array.isArray(auth.trades) ? auth.trades : [],
+        winTrades: Array.isArray(auth.winTrades) ? auth.winTrades : [],
+        hasScore,
+        pendingOrderCount,
+        note
+      });
+    }
+    return rows.sort(compareLiveRankingRows);
+  }
+
   const rows = [];
   for (const user of getActiveUsers()) {
-    const { symbolsText, symbolsHtml, heldSymbols } = formatLiveRankingHoldingsLine(user);
+    const { symbolsText, symbolsHtml, heldSymbols, allRankingSymbols } = formatLiveRankingHoldingsLine(user);
+    const rowSymbols = allRankingSymbols && allRankingSymbols.length ? allRankingSymbols : heldSymbols;
     const score = calcUserScore(user, "latest", season);
     const displayName = getDisplayNameForRanking(user, season);
     const isAnonymized = Boolean(user.aliasName) || displayName !== (user.name || "");
     if (!score) {
       const snap = getPicksForRankingSnapshot(user);
       const openPicks = snap.filter((p) => p.status !== "CLOSED").length;
-      const openPending = snap.filter((p) => p.status !== "CLOSED" && p.entryPending).length;
+      const openPending = snap.filter((p) => p.status !== "CLOSED" && isPickEntryEffectivelyPending(p)).length;
       const hasUnconfirmed = hasUncommittedPickChanges(user);
       rows.push({
         userId: user.id,
@@ -6800,7 +8156,7 @@ function buildLiveRanking() {
         isAnonymized,
         returnPct: null,
         validPickCount: 0,
-        symbols: heldSymbols,
+        symbols: rowSymbols,
         symbolsText,
         symbolsHtml,
         trades: [],
@@ -6808,12 +8164,33 @@ function buildLiveRanking() {
         hasScore: false,
         pendingOrderCount: !hasUnconfirmed && openPending > 0 ? openPending : null,
         note: hasUnconfirmed
-          ? (openPicks >= 1
+          ? (effectiveOpenPickCountForRankingNote(user) >= 1
             ? (CONFIG.minPicks > 0 ? `${CONFIG.minPicks}銘柄以上で確定してください` : "銘柄を確定してください")
             : "銘柄未登録")
           : (openPending > 0
             ? ""
             : (openPicks >= 1 ? "集計待ち" : "銘柄未登録"))
+      });
+      continue;
+    }
+    const hasRankPct = score.returnPct != null && Number.isFinite(Number(score.returnPct));
+    if (!hasRankPct) {
+      rows.push({
+        userId: user.id,
+        displayName,
+        isAnonymized,
+        returnPct: null,
+        validPickCount: Number.isFinite(Number(score.validPickCount))
+          ? Math.max(0, Math.floor(Number(score.validPickCount)))
+          : 0,
+        symbols: rowSymbols,
+        symbolsText,
+        symbolsHtml,
+        trades: score.trades,
+        winTrades: score.winTrades || [],
+        hasScore: false,
+        pendingOrderCount: null,
+        note: ""
       });
       continue;
     }
@@ -6823,7 +8200,7 @@ function buildLiveRanking() {
       isAnonymized,
       returnPct: score.returnPct,
       validPickCount: score.validPickCount,
-      symbols: heldSymbols,
+      symbols: rowSymbols,
       symbolsText,
       symbolsHtml,
       trades: score.trades,
@@ -6833,17 +8210,7 @@ function buildLiveRanking() {
       note: ""
     });
   }
-  return rows.sort((a, b) => {
-    const aRank = a.hasScore ? 1 : 0;
-    const bRank = b.hasScore ? 1 : 0;
-    if (aRank !== bRank) return bRank - aRank;
-    if (a.hasScore && b.hasScore) {
-      const diff = (b.returnPct || 0) - (a.returnPct || 0);
-      if (Math.abs(diff) > 1e-9) return diff;
-      if (b.validPickCount !== a.validPickCount) return b.validPickCount - a.validPickCount;
-    }
-    return a.displayName.localeCompare(b.displayName, "ja");
-  });
+  return rows.sort(compareLiveRankingRows);
 }
 
 function calcUserScore(user, mode, season) {
@@ -6851,12 +8218,23 @@ function calcUserScore(user, mode, season) {
   const values = [];
   const trades = [];
   const symbols = new Set();
+  const nowObj = new Date();
 
   for (const pick of picks) {
     // 確定ランキング（settled）で表示する「保有銘柄」は、最終営業日に保有していたものだけにしたい
     // そのため、ここでは評価開始時点の CLOSED/OPEN を覚えておく
     const wasClosedAtCalcStart = pick.status === "CLOSED";
-    const entry = toFiniteNumber(pick.entryPrice);
+    let entryDateKeyForCompare = pick.entryDate || pick.orderDate;
+    let entry;
+    if (mode === "latest") {
+      const r = resolveEffectiveEntryPriceForLatestScore(pick, null, nowObj);
+      entry = r ? r.price : null;
+      if (r && toFiniteNumber(pick.entryPrice) == null) {
+        entryDateKeyForCompare = r.date || pick.orderDate;
+      }
+    } else {
+      entry = toFiniteNumber(pick.entryPrice);
+    }
     if (entry == null || entry <= 0) continue;
 
     let exit = null;
@@ -6873,16 +8251,39 @@ function calcUserScore(user, mode, season) {
     } else {
       exit = toFiniteNumber(pick.latestPrice);
       exitDate = pick.latestDate;
+      if (mode === "latest") {
+        const qp = quotePriceForSymbol(pick.symbol);
+        const en = toFiniteNumber(entry);
+        // 履歴末尾の latest が取得単価と同一に張り付いているが、quote キャッシュだけ動いているケースを補正（追加の Yahoo 呼び出しはしない）
+        if (
+          en != null &&
+          en > 0 &&
+          exit != null &&
+          exit > 0 &&
+          qp != null &&
+          qp > 0 &&
+          Math.abs(exit - en) <= Math.max(1e-9, Math.abs(en) * 1e-10) &&
+          Math.abs(qp - en) > Math.max(1e-9, Math.abs(en) * 1e-10)
+        ) {
+          exit = qp;
+          exitDate = pick.latestDate || quoteAsOfDateKeyForSymbol(pick.symbol) || getDateKeyJst(new Date());
+        }
+        if ((exit == null || exit <= 0) && qp != null && qp > 0) {
+          exit = qp;
+          exitDate = pick.latestDate || quoteAsOfDateKeyForSymbol(pick.symbol);
+        }
+      }
       status = pick.sellPending ? "SELL_WAIT" : "OPEN";
     }
 
-    /* 約定済み保有で評価額がない場合は 0% として履歴に含める（Yahoo 追加アクセスなし） */
-    if (exit == null || exit <= 0) {
+    /* ライブ（latest）: 最新株価未反映の OPEN は 0% 相当で混ぜない。確定（settled）は従来どおり entry で埋める */
+    if (mode === "latest") {
+      if (exit == null || exit <= 0) continue;
+    } else if (exit == null || exit <= 0) {
       exit = entry;
       exitDate = "-";
     }
-    const entryDateKey = pick.entryDate || pick.orderDate;
-    if (exitDate && exitDate !== "-" && entryDateKey && String(exitDate).localeCompare(entryDateKey) < 0) continue;
+    if (exitDate && exitDate !== "-" && entryDateKeyForCompare && String(exitDate).localeCompare(entryDateKeyForCompare) < 0) continue;
     const pct = ((exit - entry) / entry) * 100;
     values.push(pct);
     if (mode === "settled") {
@@ -6895,7 +8296,7 @@ function calcUserScore(user, mode, season) {
       symbol: pick.symbol,
       market: pick.market,
       status,
-      entryDate: pick.entryDate || pick.orderDate,
+      entryDate: entryDateKeyForCompare,
       entryPrice: entry,
       exitDate: exitDate || "-",
       exitPrice: exit,
@@ -6903,16 +8304,54 @@ function calcUserScore(user, mode, season) {
     });
   }
 
-  if (values.length === 0) return null;
-  const avg = values.reduce((sum, x) => sum + x, 0) / values.length;
+  if (mode === "latest") {
+    const symInTrades = new Set(
+      trades.map((t) => String(t.symbol || "").toUpperCase().trim()).filter(Boolean)
+    );
+    for (const pick of picks) {
+      if (!pick || pick.status === "CLOSED") continue;
+      const u = String(pick.symbol || "").toUpperCase().trim();
+      if (!u || symInTrades.has(u)) continue;
+      symInTrades.add(u);
+      trades.push({
+        rankTradeIncomplete: true,
+        symbol: pick.symbol,
+        market: pick.market,
+        status: pick.sellPending ? "SELL_WAIT" : "OPEN",
+        entryDate: String(pick.entryDate || pick.orderDate || "-"),
+        entryPrice: toFiniteNumber(pick.entryPrice),
+        exitDate: "-",
+        exitPrice: null,
+        returnPct: null
+      });
+    }
+  }
+
   const sortedTrades = trades.sort((a, b) => String(a.entryDate).localeCompare(String(b.entryDate)));
-  const winTrades = sortedTrades.filter((t) => t.returnPct > 0);
+  const winTrades = sortedTrades.filter(
+    (t) => !t.rankTradeIncomplete && Number(t.returnPct) > 0
+  );
+
+  if (sortedTrades.length === 0 && values.length === 0) return null;
+
+  // 買注など rankTradeIncomplete の銘柄は取引行に出すが、順位用の％は約定済み・評価可能な銘柄だけで平均する
+  if (values.length === 0) {
+    return {
+      returnPct: null,
+      validPickCount: 0,
+      symbols: [...symbols].sort(),
+      trades: sortedTrades,
+      winTrades
+    };
+  }
+
+  const avg = values.reduce((sum, x) => sum + x, 0) / values.length;
   return {
     returnPct: roundTo(avg, 4),
     validPickCount: values.length,
     symbols: [...symbols].sort(),
     trades: sortedTrades,
-    winTrades
+    winTrades: sortedTrades.filter((t) => !t.rankTradeIncomplete && Number(t.returnPct) > 0)
   };
 }
 
@@ -6947,6 +8386,92 @@ function resolveFillByOrderDate(rows, orderDate, slot, market) {
     if (price != null) return { price, date: row.date, pending: false };
   }
   return { price: null, date: null, pending: true, reason: skippedStop ? "STOP_LIMIT" : "DATA_WAIT" };
+}
+
+/** ストップ高安で全日スキップされ未約定のまま残るのを防ぐ（ランキング・約定補完用） */
+function resolveFillByOrderDateLoose(rows, orderDate, slot, _market) {
+  const startIdx = rows.findIndex((row) => row.date >= orderDate);
+  if (startIdx < 0) return { price: null, date: null, pending: true, reason: "DATA_WAIT" };
+  for (let i = startIdx; i < rows.length; i += 1) {
+    const row = rows[i];
+    const price = (slot === "AM" || slot === "00") && row.open != null
+      ? row.open
+      : (row.close != null ? row.close : row.open);
+    if (price != null) return { price, date: row.date, pending: false };
+  }
+  return { price: null, date: null, pending: true, reason: "DATA_WAIT" };
+}
+
+/** 履歴キャッシュを銘柄キー揺れ（7974 / 7974.T）でも引けるようにする */
+function historyRowsForSymbol(symbol) {
+  const c = app?.state?.apiCache?.history || {};
+  const tryRows = (k) => {
+    const rows = c[k]?.rows;
+    return Array.isArray(rows) && rows.length ? rows : null;
+  };
+  const raw = String(symbol || "").trim();
+  if (!raw) return null;
+  let rows = tryRows(raw);
+  if (rows) return rows;
+  const u = raw.toUpperCase();
+  rows = tryRows(u);
+  if (rows) return rows;
+  if (/\.T$/i.test(u)) {
+    rows = tryRows(u.replace(/\.T$/i, ""));
+    if (rows) return rows;
+  } else if (/^\d{3,4}[A-Z]?$/i.test(u)) {
+    rows = tryRows(`${u}.T`);
+    if (rows) return rows;
+  }
+  return null;
+}
+
+function findQuoteCacheEntry(symbol) {
+  const c = app?.state?.apiCache?.quote || {};
+  const raw = String(symbol || "").trim();
+  if (!raw) return null;
+  const u = raw.toUpperCase();
+  const keys = [raw, u];
+  if (/\.T$/i.test(u)) keys.push(u.replace(/\.T$/i, ""));
+  else if (/^\d{3,4}[A-Z]?$/i.test(u)) keys.push(`${u}.T`);
+  for (const k of keys) {
+    const ent = c[k];
+    const p = toFiniteNumber(ent?.data?.price);
+    if (p != null && p > 0) return ent;
+  }
+  return null;
+}
+
+function quotePriceForSymbol(symbol) {
+  return toFiniteNumber(findQuoteCacheEntry(symbol)?.data?.price);
+}
+
+function quoteAsOfDateKeyForSymbol(symbol) {
+  const ent = findQuoteCacheEntry(symbol);
+  const ms = toFiniteNumber(ent?.data?.asOfMs);
+  if (ms == null || !Number.isFinite(ms)) return null;
+  const d = new Date(ms);
+  return `${d.getUTCFullYear()}-${pad2(d.getUTCMonth() + 1)}-${pad2(d.getUTCDate())}`;
+}
+
+/** 約定スロット経過後も、履歴の slot 価格（strict→loose）のみで推定。最新値・quote での仮約定はしない。 */
+function resolveEffectiveEntryPriceForLatestScore(pick, rows, nowObj) {
+  const ep = toFiniteNumber(pick.entryPrice);
+  if (ep != null && ep > 0) return { price: ep, date: pick.entryDate || pick.orderDate };
+  const slotPassed = hasOrderSlotPassed(pick.orderDate, pick.orderSlot, pick.market, nowObj);
+  if (!slotPassed) return null;
+  const histRows = Array.isArray(rows) && rows.length ? rows : historyRowsForSymbol(pick.symbol);
+  if (histRows?.length) {
+    const strict = resolveFillByOrderDate(histRows, pick.orderDate, pick.orderSlot, pick.market);
+    if (!strict.pending && strict.price != null) {
+      return { price: strict.price, date: strict.date || pick.orderDate };
+    }
+    const loose = resolveFillByOrderDateLoose(histRows, pick.orderDate, pick.orderSlot, pick.market);
+    if (!loose.pending && loose.price != null) {
+      return { price: loose.price, date: loose.date || pick.orderDate };
+    }
+  }
+  return null;
 }
 
 function getLatestFromRows(rows) {
@@ -7122,7 +8647,16 @@ async function settleSeason(season) {
     });
   }
 
-  rows.sort((a, b) => b.returnPct - a.returnPct || b.validPickCount - a.validPickCount || a.displayName.localeCompare(b.displayName, "ja"));
+  rows.sort((a, b) => {
+    const nb = Number(b.returnPct);
+    const na = Number(a.returnPct);
+    const vb = Number.isFinite(nb) ? nb : -Infinity;
+    const va = Number.isFinite(na) ? na : -Infinity;
+    if (vb !== va) return vb - va;
+    const vc = (Number(b.validPickCount) || 0) - (Number(a.validPickCount) || 0);
+    if (vc !== 0) return vc;
+    return String(a.displayName || "").localeCompare(String(b.displayName || ""), "ja");
+  });
   app.state.rankings.push({
     season,
     settledAt: new Date().toISOString(),
@@ -7173,7 +8707,7 @@ function trimRankings() {
 }
 
 async function fetchQuote(symbol, force) {
-  const cache = app.state.apiCache.quote[symbol];
+  let cache = app.state.apiCache.quote[symbol];
   const market = inferMarketFromKnownSymbol(symbol);
   const now = new Date();
   const marketClosed = market !== "CRYPTO" && isMarketClosedNow(market, now);
@@ -7246,6 +8780,44 @@ async function fetchQuote(symbol, force) {
     return cache.data;
   }
 
+  if (market !== "CRYPTO" && getSupabaseCloudConfig()) {
+    const needSharedQuote =
+      force ||
+      cache?.data?.price == null ||
+      Date.now() - (cache?.ts || 0) >= CONFIG.quoteTtlMs;
+    if (needSharedQuote) {
+      await tryHydrateSharedMarketQuoteOne(symbol);
+      cache = app.state.apiCache.quote[symbol];
+    }
+  }
+
+  if (!force && cache && Date.now() - cache.ts < CONFIG.quoteTtlMs) {
+    if (marketClosed) {
+      const hist = app.state.apiCache.history[symbol];
+      const latest = hist?.rows?.length ? getLatestFromRows(hist.rows) : null;
+      if (latest?.price != null) {
+        const data = buildQuoteFromLatest(latest);
+        cacheQuoteData(symbol, data);
+        app.lastApiFailure = null;
+        return data;
+      }
+    }
+    return cache.data;
+  }
+
+  // Yahoo 非許可: 共有 quote を試したあと、まだ無ければ共有/ローカル日足で終値を組む（v7 に行かない）
+  if (!force && !isYahooAccessAllowed(symbol) && market !== "CRYPTO") {
+    await tryHydrateSharedMarketHistoryOne(symbol);
+    const histY = app.state.apiCache.history[symbol];
+    const latestY = histY?.rows?.length ? getLatestFromRows(histY.rows) : null;
+    if (latestY?.price != null) {
+      const data = buildQuoteFromLatest(latestY);
+      cacheQuoteData(symbol, data, histY.ts);
+      app.lastApiFailure = null;
+      return data;
+    }
+  }
+
   // 市場クローズかつ日足が未キャッシュ: v7 を2回試すより chart 1 本の方が往復が少なく終値にも一致しやすい
   if (market !== "CRYPTO" && marketClosed) {
     const histPre = app.state.apiCache.history[symbol];
@@ -7266,8 +8838,8 @@ async function fetchQuote(symbol, force) {
     }
   }
 
-  // force=true またはキャッシュに価格が無い場合は Yahoo を試す（初回は必ず取得できるようにする）
-  if (force || isYahooAccessAllowed(symbol) || cache?.data?.price == null) {
+  // Yahoo 許可ウィンドウ外かつ force=false のときは v7 を叩かない（上で日足合成済み。無ければフォールバックへ）
+  if (force || isYahooAccessAllowed(symbol)) {
   for (const url of urls) {
     try {
       const json = await queuedFetchJson(url);
@@ -7286,6 +8858,7 @@ async function fetchQuote(symbol, force) {
         asOfMs: result.regularMarketTime ? Number(result.regularMarketTime) * 1000 : Date.now()
       };
       cacheQuoteData(symbol, data);
+      queueSharedMarketQuotePut(symbol, data);
       app.lastApiFailure = null;
       return data;
     } catch (error) {
@@ -7302,6 +8875,7 @@ async function fetchQuote(symbol, force) {
   try {
     const fallback = await fetchQuoteFallback(symbol, attempts);
     cacheQuoteData(symbol, fallback);
+    queueSharedMarketQuotePut(symbol, fallback);
     app.lastApiFailure = null;
     return fallback;
   } catch (fallbackError) {
@@ -7383,6 +8957,18 @@ async function fetchHistory(symbol, force, settleSeasonKey) {
     return { symbol, rows: cache.rows };
   }
 
+  if (!settleKey) {
+    await tryHydrateSharedMarketHistoryOne(symbol);
+    const hAfter = app.state.apiCache.history[symbol];
+    if (!force && hAfter && Date.now() - hAfter.ts < CONFIG.historyTtlMs && Array.isArray(hAfter.rows)) {
+      return { symbol, rows: hAfter.rows };
+    }
+  }
+
+  /* hydrate 後も const cache は古い参照のことがあるため、常に最新スロットを見る */
+  const histCache = app.state.apiCache.history[symbol];
+  const hasHistoryRows = Boolean(histCache && Array.isArray(histCache.rows) && histCache.rows.length);
+
   const attempts = [];
   const rangeForSettle = force && settleKey ? getUnixRangeForSeasonChart(settleKey) : null;
   const rangeParam = rangeForSettle
@@ -7392,14 +8978,16 @@ async function fetchHistory(symbol, force, settleSeasonKey) {
     `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(symbol)}?interval=1d&${rangeParam}`
   ];
 
-  // Yahoo 利用不可（市場時間外など）なら、疑似履歴を作らずキャッシュ履歴を返す
-  // ※ force=true は「明示的に最新化したい」ケースなので Yahoo 優先
-  if (!force && !isYahooAccessAllowed(symbol) && cache?.rows?.length) {
-    return { symbol, rows: cache.rows };
+  // 市場時間外はキャッシュがあればそれを返して負荷を抑える。
+  // 履歴が1本も無いときは Stooq 等のフォールバックがブラウザ CORS で使えないため、Yahoo を許可する（11:13 JST など窓外での初回取得失敗を防ぐ）。
+  if (!force && !isYahooAccessAllowed(symbol) && !settleKey && hasHistoryRows) {
+    return { symbol, rows: histCache.rows };
   }
 
-  // force=true またはキャッシュに履歴が無い場合は Yahoo を試す（初回は必ず取得できるようにする）
-  if (force || isYahooAccessAllowed(symbol) || !(cache?.rows?.length)) {
+  const allowYahooHistory =
+    force || Boolean(settleKey) || isYahooAccessAllowed(symbol) || !hasHistoryRows;
+
+  if (allowYahooHistory) {
   for (const url of urls) {
     try {
       const json = await queuedFetchJson(url);
@@ -7433,6 +9021,7 @@ async function fetchHistory(symbol, force, settleSeasonKey) {
       if (!rows.length) throw new Error("Yahoo history is empty");
       rows.sort((a, b) => a.date.localeCompare(b.date));
       cacheHistoryRows(symbol, rows);
+      queueSharedMarketHistoryPut(symbol, rows);
       app.lastApiFailure = null;
       return { symbol, rows: app.state.apiCache.history[symbol].rows };
     } catch (error) {
@@ -7444,6 +9033,7 @@ async function fetchHistory(symbol, force, settleSeasonKey) {
   try {
     const fallbackRows = await fetchHistoryFallback(symbol, attempts);
     cacheHistoryRows(symbol, fallbackRows);
+    queueSharedMarketHistoryPut(symbol, fallbackRows);
     app.lastApiFailure = null;
     return { symbol, rows: app.state.apiCache.history[symbol].rows };
   } catch (fallbackError) {
@@ -7452,27 +9042,30 @@ async function fetchHistory(symbol, force, settleSeasonKey) {
 
   // 疑似履歴（現在値だけで1本履歴を作る）を作らない。
   // キャッシュがあればそれを使い、無ければエラーにする。
-  if (cache?.rows?.length) {
+  const histFallback = app.state.apiCache.history[symbol];
+  if (histFallback?.rows?.length) {
     app.lastApiFailure = null;
-    return { symbol, rows: cache.rows };
+    return { symbol, rows: histFallback.rows };
   }
 
   const merged = buildApiError("履歴取得に失敗しました。", "history", symbol, attempts, null);
   captureApiFailure(merged, symbol, "history");
   throw merged;
 }
-function cacheQuoteData(symbol, data) {
+function cacheQuoteData(symbol, data, tsOverride) {
+  const tsNum = Number(tsOverride);
   app.state.apiCache.quote[symbol] = {
-    ts: Date.now(),
+    ts: Number.isFinite(tsNum) ? tsNum : Date.now(),
     data
   };
   pruneApiCache(app.state.apiCache);
   scheduleSaveState();
 }
 
-function cacheHistoryRows(symbol, rows) {
+function cacheHistoryRows(symbol, rows, tsOverride) {
+  const tsNum = Number(tsOverride);
   app.state.apiCache.history[symbol] = {
-    ts: Date.now(),
+    ts: Number.isFinite(tsNum) ? tsNum : Date.now(),
     rows: rows.slice(-220)
   };
   pruneApiCache(app.state.apiCache);
@@ -7488,9 +9081,8 @@ async function fetchQuoteFallback(symbol, attempts = []) {
       recordApiAttempt(attempts, "CryptoCompare", "https://min-api.cryptocompare.com/data/price", error);
     }
   }
-  // Stooq はブラウザCORSで失敗しやすいため、ここでは呼ばない。
-  // 呼び出し元では fetchHistory（Yahoo）由来のフォールバックがあるため、そちらへ回す。
-  const err = new Error("Stooq is not usable in browser (CORS).");
+  // Stooq は CORS でブラウザから呼べないため未使用。メッセージに "CORS" を含めない（失敗理由が Stooq 通信エラーと誤解されないよう）。
+  const err = new Error("no_browser_quote_fallback");
   recordApiAttempt(attempts, "Stooq", "https://stooq.com", err);
   throw buildApiError("株価APIの現在値取得に失敗しました。", "quote", symbol, attempts, err);
 }
@@ -7535,9 +9127,8 @@ async function fetchHistoryFallback(symbol, attempts = []) {
       recordApiAttempt(attempts, "CryptoCompare", "https://min-api.cryptocompare.com/data/v2/histoday", error);
     }
   }
-  // Stooq はブラウザCORSで失敗しやすいため、ここでは呼ばない。
-  // Yahoo history がダメな場合は最終的にエラーになる。
-  const err = new Error("Stooq is not usable in browser (CORS).");
+  // Stooq は CORS でブラウザから呼べないため未使用（履歴は Yahoo か共有キャッシュ頼み）。
+  const err = new Error("no_browser_history_fallback");
   recordApiAttempt(attempts, "Stooq", "https://stooq.com", err);
   throw buildApiError("株価APIの履歴取得に失敗しました。", "history", symbol, attempts, err);
 }
@@ -7629,6 +9220,16 @@ let lastFetchAbuseCooldownEscalationAt = 0;
 /** Yahoo Finance ドメインへの連続リクエスト間隔（query1 / chart / search 共通） */
 let lastYahooFinanceRequestAt = 0;
 
+function getEffectiveYahooFinanceMinGapMs() {
+  if (app.rankBulkYahooMinGapActive) {
+    const bulk = Number(CONFIG.rankBulkYahooMinGapMs);
+    if (Number.isFinite(bulk) && bulk >= 0) return Math.max(0, bulk);
+    return 400;
+  }
+  const normal = Number(CONFIG.yahooFinanceMinGapMs);
+  return Number.isFinite(normal) && normal >= 0 ? normal : 850;
+}
+
 /** saveState でキャッシュ全消し通知を連打しない */
 let saveStateCacheClearNoticeShown = false;
 
@@ -7663,7 +9264,7 @@ function isYahooFinanceUrl(url) {
 
 async function waitYahooFinanceMinIntervalIfNeeded(url) {
   if (!isYahooFinanceUrl(url)) return;
-  const minGap = Number(CONFIG.yahooFinanceMinGapMs) || 0;
+  const minGap = getEffectiveYahooFinanceMinGapMs();
   if (minGap <= 0) return;
   const wait = Math.max(0, lastYahooFinanceRequestAt + minGap - Date.now());
   if (wait > 0) await sleep(wait);
@@ -7710,8 +9311,9 @@ async function queuedFetchJson(url) {
       app.interactiveFetch && Number.isFinite(CONFIG.interactiveFetchGapMs)
         ? CONFIG.interactiveFetchGapMs
         : CONFIG.fetchGapMs;
+    const yahooGap = getEffectiveYahooFinanceMinGapMs();
     const gapMs = isYahooFinanceUrl(url)
-      ? Math.max(baseGap, Number(CONFIG.yahooFinanceMinGapMs) || 0)
+      ? Math.max(baseGap, yahooGap)
       : baseGap;
     app.nextFetchAt = Date.now() + gapMs;
     const timeoutMs = app.interactiveFetch && CONFIG.interactiveFetchTimeoutMs
@@ -7735,8 +9337,9 @@ async function queuedFetchText(url) {
       app.interactiveFetch && Number.isFinite(CONFIG.interactiveFetchGapMs)
         ? CONFIG.interactiveFetchGapMs
         : CONFIG.fetchGapMs;
+    const yahooGap = getEffectiveYahooFinanceMinGapMs();
     const gapMs = isYahooFinanceUrl(url)
-      ? Math.max(baseGap, Number(CONFIG.yahooFinanceMinGapMs) || 0)
+      ? Math.max(baseGap, yahooGap)
       : baseGap;
     app.nextFetchAt = Date.now() + gapMs;
     const timeoutMs = app.interactiveFetch && CONFIG.interactiveFetchTimeoutMs
@@ -7800,6 +9403,87 @@ function buildFetchUrl(rawUrl, prefix) {
   return `${prefix}${rawUrl}`;
 }
 
+/** 公開プロキシ経由の本文から Yahoo API の JSON を抜き出す（Markdown ラップ・allorigins の contents ラップに多少耐性） */
+function parseJsonFromYahooProxyText(text) {
+  let trimmed = String(text || "").trim();
+  if (trimmed.startsWith("{") && trimmed.includes('"contents"')) {
+    try {
+      const wrap = JSON.parse(trimmed);
+      if (wrap && typeof wrap.contents === "string") trimmed = wrap.contents.trim();
+    } catch (_) {}
+  }
+  const firstChar = trimmed[0] || "";
+  if (firstChar === "{") {
+    const lastIdx = trimmed.lastIndexOf("}");
+    if (lastIdx > 0) return JSON.parse(trimmed.slice(0, lastIdx + 1));
+  }
+  if (firstChar === "[") {
+    const lastIdx = trimmed.lastIndexOf("]");
+    if (lastIdx > 0) return JSON.parse(trimmed.slice(0, lastIdx + 1));
+  }
+  const i = trimmed.indexOf("{");
+  const j = trimmed.lastIndexOf("}");
+  if (i >= 0 && j > i) return JSON.parse(trimmed.slice(i, j + 1));
+  throw new Error("プロキシ応答から JSON を解釈できませんでした。");
+}
+
+/**
+ * @param {string} rawUrl
+ * @param {number} timeoutMs
+ * @param {"json"|"text"} mode
+ * @returns {Promise<unknown>}
+ */
+async function tryYahooFinanceThroughFallbackProxies(rawUrl, timeoutMs, mode) {
+  const prefixes = Array.isArray(CONFIG.yahooProxyFallbackPrefixes) ? CONFIG.yahooProxyFallbackPrefixes : [];
+  const attempts = [];
+  let lastErr = null;
+  const tm = Math.max(Number(timeoutMs) || 5000, app.interactiveFetch ? 12000 : 8000);
+
+  for (const prefix of prefixes) {
+    if (!prefix || typeof prefix !== "string") continue;
+    try {
+      checkAbuseFetchGateOrThrow();
+      await waitYahooFinanceMinIntervalIfNeeded(rawUrl);
+      const proxyUrl = buildFetchUrl(rawUrl, prefix);
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), tm);
+      let res;
+      try {
+        res = await fetch(proxyUrl, { method: "GET", cache: "no-store", signal: controller.signal });
+      } finally {
+        clearTimeout(timer);
+      }
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const bodyText = await res.text();
+      if (mode === "text") {
+        rememberFetchRoute(rawUrl, prefix);
+        return String(bodyText || "");
+      }
+      const json = parseJsonFromYahooProxyText(bodyText);
+      rememberFetchRoute(rawUrl, prefix);
+      return json;
+    } catch (e) {
+      const reason = summarizeApiError(e);
+      attempts.push({ route: `proxy:${getHostFromUrl(prefix) || "custom"}`, reason });
+      lastErr = e instanceof Error ? e : new Error(String(e));
+      if (lastErr instanceof Error && /負荷防止|通信が制限|制限されています/.test(lastErr.message)) {
+        const joined = attempts.map((x) => `${x.route} ${x.reason}`).join(" | ");
+        lastErr.message = joined || lastErr.message;
+        lastErr.proxyFallbackAttempts = attempts;
+        throw lastErr;
+      }
+    }
+  }
+
+  if (lastErr) {
+    const joined = attempts.map((x) => `${x.route} ${x.reason}`).join(" | ");
+    lastErr.message = joined || lastErr.message;
+    lastErr.proxyFallbackAttempts = attempts;
+    throw lastErr;
+  }
+  throw new Error("Yahoo 用フォールバックプロキシが設定されていません。");
+}
+
 function rememberFetchRoute(rawUrl, prefix) {
   const host = getHostFromUrl(rawUrl);
   if (!host) return;
@@ -7861,37 +9545,20 @@ async function fetchJson(url, timeoutMs) {
       .join(" | ");
     lastError.message = joined || lastError.message;
     lastError.routeAttempts = routeAttempts;
-    // Yahoo はブラウザCORSで落ちることがあるため、直取得失敗後は Jina で回復を試す。
-    // Jina も Yahoo への間接アクセスなので、abuse ゲート＋Yahoo 間隔を通してから試す。
+    // Yahoo はブラウザ CORS で落ちることがあるため、直取得失敗後はフォールバックプロキシを順に試す。
     try {
       const rawUrl = String(url || "");
-      if (!abortedByFetchGate && /finance\.yahoo\.com/i.test(rawUrl)) {
-        checkAbuseFetchGateOrThrow();
-        await waitYahooFinanceMinIntervalIfNeeded(rawUrl);
-        const jinaUrl = "https://r.jina.ai/" + rawUrl;
-        const jinaTimeoutMs = Math.max(Number(timeoutMs) || 5000, app.interactiveFetch ? 12000 : 8000);
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), jinaTimeoutMs);
-        const res = await fetch(jinaUrl, { method: "GET", cache: "no-store", signal: controller.signal });
-        const text = await res.text();
-        clearTimeout(timer);
-        const trimmed = String(text || "").trim();
-        const firstChar = trimmed[0] || "";
-        if (firstChar === "{") {
-          const lastIdx = trimmed.lastIndexOf("}");
-          if (lastIdx > 0) return JSON.parse(trimmed.slice(0, lastIdx + 1));
-        }
-        if (firstChar === "[") {
-          const lastIdx = trimmed.lastIndexOf("]");
-          if (lastIdx > 0) return JSON.parse(trimmed.slice(0, lastIdx + 1));
-        }
-        // それ以外でも、JSON塊が含まれている可能性があるので最初の '{' から最後の '}' を抜く
-        const i = trimmed.indexOf("{");
-        const j = trimmed.lastIndexOf("}");
-        if (i >= 0 && j > i) return JSON.parse(trimmed.slice(i, j + 1));
+      if (
+        !abortedByFetchGate &&
+        /finance\.yahoo\.com/i.test(rawUrl) &&
+        CONFIG.yahooProxyFallbackPrefixes?.length
+      ) {
+        return await tryYahooFinanceThroughFallbackProxies(rawUrl, timeoutMs, "json");
       }
     } catch (proxyErr) {
       if (proxyErr instanceof Error && /負荷防止|通信が制限|制限されています/.test(proxyErr.message)) {
+        lastError = proxyErr;
+      } else if (proxyErr instanceof Error) {
         lastError = proxyErr;
       }
     }
@@ -7947,23 +9614,20 @@ async function fetchText(url, timeoutMs) {
       .join(" | ");
     lastError.message = joined || lastError.message;
     lastError.routeAttempts = routeAttempts;
-    // Yahoo のテキスト取得も CORS で失敗する場合があるため、最後に Jina を試す（対話中も同様）
+    // Yahoo のテキスト取得も CORS で失敗する場合があるため、フォールバックプロキシを順に試す
     try {
       const rawUrl = String(url || "");
-      if (!abortedByFetchGate && /finance\.yahoo\.com/i.test(rawUrl)) {
-        checkAbuseFetchGateOrThrow();
-        await waitYahooFinanceMinIntervalIfNeeded(rawUrl);
-        const jinaUrl = "https://r.jina.ai/" + rawUrl;
-        const jinaTimeoutMs = Math.max(Number(timeoutMs) || 5000, app.interactiveFetch ? 12000 : 8000);
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), jinaTimeoutMs);
-        const res = await fetch(jinaUrl, { method: "GET", cache: "no-store", signal: controller.signal });
-        const text = await res.text();
-        clearTimeout(timer);
-        return String(text || "");
+      if (
+        !abortedByFetchGate &&
+        /finance\.yahoo\.com/i.test(rawUrl) &&
+        CONFIG.yahooProxyFallbackPrefixes?.length
+      ) {
+        return await tryYahooFinanceThroughFallbackProxies(rawUrl, timeoutMs, "text");
       }
     } catch (proxyErr) {
       if (proxyErr instanceof Error && /負荷防止|通信が制限|制限されています/.test(proxyErr.message)) {
+        lastError = proxyErr;
+      } else if (proxyErr instanceof Error) {
         lastError = proxyErr;
       }
     }
@@ -8018,8 +9682,9 @@ async function searchSymbolsByName(query, marketType, limit = 8) {
   if (!normalized) return [];
   const safeLimit = Number.isFinite(limit) ? Math.max(1, Math.min(30, Math.floor(limit))) : 8;
   const cacheKey = `${marketType}:${normalizeSearchKey(normalized)}`;
+  const searchTtl = Math.max(60_000, Number(CONFIG.yahooSearchSuggestCacheTtlMs) || 12 * 60 * 1000);
   const cacheHit = app.symbolSuggestCache.get(cacheKey);
-  if (cacheHit && Date.now() - cacheHit.ts < 5 * 60 * 1000) {
+  if (cacheHit && Date.now() - cacheHit.ts < searchTtl) {
     const rows = cacheHit.rows.slice(0, safeLimit);
     if (marketType === "JP") {
       rows.sort((a, b) => {
@@ -8112,7 +9777,7 @@ async function searchSymbolsByName(query, marketType, limit = 8) {
 
   // 連想キャッシュは TTL + 件数上限で抑制（長時間稼働のメモリ増を防ぐ）
   const nowTs = Date.now();
-  const ttlMs = 5 * 60 * 1000;
+  const ttlMs = Math.max(60_000, Number(CONFIG.yahooSearchSuggestCacheTtlMs) || 12 * 60 * 1000);
   for (const [k, v] of app.symbolSuggestCache.entries()) {
     if (!v || !Number.isFinite(v.ts)) continue;
     if (nowTs - v.ts > ttlMs) app.symbolSuggestCache.delete(k);
@@ -8552,6 +10217,7 @@ function createDefaultState() {
     currentSeason: getSeasonKeyJst(new Date()),
     lastDailyRefreshDate: "",
     lastRankUpdateAt: "",
+    publicRankingSnapshotAt: "",
     lastSavedAtMs: 0,
     sessionUserId: null,
     settings: {},
@@ -8600,6 +10266,8 @@ function normalizeState(source) {
   }
   state.lastDailyRefreshDate = typeof source.lastDailyRefreshDate === "string" ? source.lastDailyRefreshDate : "";
   state.lastRankUpdateAt = typeof source.lastRankUpdateAt === "string" ? source.lastRankUpdateAt : "";
+  state.publicRankingSnapshotAt =
+    typeof source.publicRankingSnapshotAt === "string" ? source.publicRankingSnapshotAt : "";
   const rawLastSaved = Number(source.lastSavedAtMs);
   state.lastSavedAtMs = Number.isFinite(rawLastSaved) && rawLastSaved > 0 ? rawLastSaved : 0;
   state.sessionUserId = typeof source.sessionUserId === "string" ? source.sessionUserId : null;
@@ -8657,6 +10325,11 @@ function seedDeviceSeasonConsumedFromUsers(state) {
   state.security.deviceSeasonConsumed = trimmed;
 }
 
+/** スナップショット JSON で isDeleted が文字列 "false" 等になると truthy 扱いで参加者が消えるのを防ぐ */
+function isUserMarkedDeletedRaw(v) {
+  return v === true || v === 1;
+}
+
 function isValidUserShape(v) {
   return v && typeof v === "object" && typeof v.id === "string" && typeof v.name === "string";
 }
@@ -8669,9 +10342,17 @@ function normalizeUser(v) {
   const picksLastConfirmedSource = hasExplicitPicksLastConfirmed
     ? v.picksLastConfirmed.filter(isValidPickShape).slice(0, CONFIG.maxPicks + 24).map(normalizePick)
     : clonePicksForDraft(normalizedPicks);
-  const hadUncommitted =
-    v.needsPickConfirm === true || Boolean(v.pickListModified);
-  const picks = hadUncommitted ? clonePicksForDraft(picksLastConfirmedSource) : normalizedPicks;
+  /*
+   * 旧実装: needsPickConfirm / pickListModified 時に picks を picksLastConfirmed に戻していたため、
+   * 確定が古いアカウントで任天堂などが消えた状態が save-state で DB に固定化された。
+   * 常に保存された picks を正とし、確定スナップショットとの差は needsPickConfirm で表す。
+   */
+  const picksLastConfirmedClone = clonePicksForDraft(picksLastConfirmedSource);
+  const picks = clonePicksForDraft(normalizedPicks);
+  const structMismatch =
+    buildPicksStructuralHash(picks) !== buildPicksStructuralHash(picksLastConfirmedClone);
+  const needsPickConfirm =
+    Boolean(v.needsPickConfirm) || Boolean(v.pickListModified) || structMismatch;
   return {
     id: v.id,
     name: String(v.name || "").slice(0, 24),
@@ -8685,14 +10366,14 @@ function normalizeUser(v) {
     recoveryHash: String(v.recoveryHash || ""),
     registeredDeviceId: typeof v.registeredDeviceId === "string" ? v.registeredDeviceId : "",
     aliasName: String(v.aliasName || "").slice(0, 40),
-    isDeleted: Boolean(v.isDeleted),
-    needsPickConfirm: hadUncommitted ? false : Boolean(v.needsPickConfirm),
+    isDeleted: isUserMarkedDeletedRaw(v.isDeleted),
+    needsPickConfirm,
     pickListModified: false,
     lastPickConfirmAt: typeof v.lastPickConfirmAt === "string" ? v.lastPickConfirmAt : "",
     createdAt: typeof v.createdAt === "string" ? v.createdAt : new Date().toISOString(),
     updatedAt: typeof v.updatedAt === "string" ? v.updatedAt : new Date().toISOString(),
     picks,
-    picksLastConfirmed: clonePicksForDraft(picksLastConfirmedSource)
+    picksLastConfirmed: picksLastConfirmedClone
   };
 }
 
@@ -8701,7 +10382,12 @@ function isValidPickShape(v) {
 }
 
 function normalizePick(v) {
-  const symRaw = String(v.symbol || "").slice(0, 48);
+  let symRaw = String(v.symbol || "").trim().slice(0, 48);
+  /* 東証コードのみの旧データを .T 付きにし、市場推定・キャッシュキーを安定させる */
+  if (symRaw && !/\.T$/i.test(symRaw)) {
+    const core = symRaw.toUpperCase();
+    if (/^\d{3,4}[A-Z]?$/.test(core)) symRaw = `${core}.T`.slice(0, 48);
+  }
   const market = normalizeMarket(v.market, symRaw);
   let orderSlot = v.orderSlot == null || v.orderSlot === "" ? null : String(v.orderSlot);
   if (orderSlot == null && typeof v.orderedAt === "string") {
@@ -8712,6 +10398,15 @@ function normalizePick(v) {
   }
   if (orderSlot == null) orderSlot = market === "JP" ? "PM" : market === "US" ? "PM" : "12";
   const sellOrderSlot = v.sellOrderSlot == null || v.sellOrderSlot === "" ? orderSlot : String(v.sellOrderSlot);
+  const entryPriceNorm = (() => {
+    const n = toFiniteNumber(v.entryPrice);
+    return n != null && n > 0 ? n : null;
+  })();
+  const exitPriceNorm = (() => {
+    const n = toFiniteNumber(v.exitPrice);
+    return n != null && n > 0 ? n : null;
+  })();
+  const statusClosed = v.status === "CLOSED";
   return {
     id: v.id,
     symbol: symRaw,
@@ -8730,18 +10425,21 @@ function normalizePick(v) {
     })(),
     orderSlot,
     orderedAt: typeof v.orderedAt === "string" ? v.orderedAt : new Date().toISOString(),
-    status: v.status === "CLOSED" ? "CLOSED" : "OPEN",
-    entryPrice: (() => { const n = toFiniteNumber(v.entryPrice); return n != null && n > 0 ? n : null; })(),
+    status: statusClosed ? "CLOSED" : "OPEN",
+    entryPrice: entryPriceNorm,
     entryDate: typeof v.entryDate === "string" ? v.entryDate : null,
     entrySettledAt: typeof v.entrySettledAt === "string" ? v.entrySettledAt : "",
-    entryPending: Boolean(v.entryPending || v.entryPrice == null),
+    entryPending:
+      entryPriceNorm != null
+        ? false
+        : Boolean(v.entryPending || toFiniteNumber(v.entryPrice) == null),
     latestPrice: toFiniteNumber(v.latestPrice),
     latestDate: typeof v.latestDate === "string" ? v.latestDate : null,
     latestResolvedAt: typeof v.latestResolvedAt === "string" ? v.latestResolvedAt : "",
-    sellPending: Boolean(v.sellPending),
+    sellPending: statusClosed || exitPriceNorm != null ? false : Boolean(v.sellPending),
     sellOrderDate: typeof v.sellOrderDate === "string" ? v.sellOrderDate : null,
     sellOrderSlot: sellOrderSlot,
-    exitPrice: (() => { const n = toFiniteNumber(v.exitPrice); return n != null && n > 0 ? n : null; })(),
+    exitPrice: exitPriceNorm,
     exitDate: typeof v.exitDate === "string" ? v.exitDate : null,
     sellSettledAt: typeof v.sellSettledAt === "string" ? v.sellSettledAt : "",
     entryPendingReason:
@@ -8770,7 +10468,9 @@ function normalizeRanking(v) {
       name: String(r.name || "").slice(0, 64),
       displayName: String(r.displayName || r.name || "").slice(0, 64),
       isAnonymized: Boolean(r.isAnonymized),
-      returnPct: toFiniteNumber(r.returnPct) ?? 0,
+      returnPct: r.returnPct === null || r.returnPct === undefined
+        ? null
+        : (toFiniteNumber(r.returnPct) ?? 0),
       validPickCount: Number.isFinite(r.validPickCount) ? Math.max(0, Math.floor(r.validPickCount)) : 0,
       symbols: Array.isArray(r.symbols)
         ? r.symbols.map((x) => String(x || "").slice(0, 48)).filter(Boolean).slice(0, 32)
@@ -9026,8 +10726,15 @@ function formatPct(value) {
 }
 
 function computePickPct(pick) {
-  const entry = toFiniteNumber(pick.entryPrice);
-  const ref = pick.status === "CLOSED" ? toFiniteNumber(pick.exitPrice) : toFiniteNumber(pick.latestPrice);
+  const eff = resolveEffectiveEntryPriceForLatestScore(pick, null, new Date());
+  const entry =
+    eff != null && eff.price != null && eff.price > 0
+      ? eff.price
+      : toFiniteNumber(pick.entryPrice);
+  let ref = pick.status === "CLOSED" ? toFiniteNumber(pick.exitPrice) : toFiniteNumber(pick.latestPrice);
+  if (pick.status !== "CLOSED" && (ref == null || ref <= 0)) {
+    ref = quotePriceForSymbol(pick.symbol);
+  }
   if (entry == null || ref == null || entry <= 0) return null;
   return ((ref - entry) / entry) * 100;
 }
@@ -9245,7 +10952,10 @@ function isPurchaseWindowOpen(date) {
   return p.day >= 1 && p.day <= CONFIG.purchaseDays;
 }
 
-/** Yahoo Finance の利用可否。市場時間外はキャッシュ優先にして負荷を抑える。 */
+/**
+ * Yahoo Finance の利用可否。市場時間外はキャッシュ優先にして負荷を抑える。
+ * 履歴がまだ無い銘柄は fetchHistory 側で窓外でも Yahoo を試す（ブラウザから Stooq 等にフォールバックできないため）。
+ */
 function isYahooAccessAllowed(symbol) {
   const s = String(symbol || "").toUpperCase();
   if (s.endsWith(".T")) {
@@ -9293,8 +11003,8 @@ function computeEffectiveOrderDate(market, now) {
   if (market === "JP") {
     const p = getTimePartsByZone(date, "Asia/Tokyo");
     const dateKey = `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
-    // 日本株の PM 約定は 15:33 頃なので、15:30-15:32 は翌日へ送らない
-    if (p.hour > 15 || (p.hour === 15 && p.minute >= 33)) {
+    // 日本株 PM 約定は 16:00（終値）想定。16:00 以降の注文は翌営業日 AM 扱い
+    if (p.hour >= 16) {
       return shiftDateKey(dateKey, 1);
     }
     return dateKey;
@@ -9319,12 +11029,12 @@ function computeEffectiveOrderDate(market, now) {
   return `${p.year}-${pad2(p.month)}-${pad2(p.day)}`;
 }
 
-/** 日本株・米国株: 1日2回のみ約定。AM=始値30分後, PM=終値（日本株は15:33頃）。仮想通貨: "00"=00:00, "12"=12:00 (JST) */
+/** 日本株・米国株: 1日2回のみ約定。AM=9:30, JP PM=16:00（終値）, US PM=16:00 NY。仮想通貨: "00"/"12" JST */
 function getOrderSlotForMarket(market, now) {
   const date = now instanceof Date ? now : new Date();
   if (market === "JP") {
     const p = getTimePartsByZone(date, "Asia/Tokyo");
-    if (p.hour > 15 || (p.hour === 15 && p.minute >= 33)) return "AM";
+    if (p.hour >= 16) return "AM";
     return p.hour < 9 || (p.hour === 9 && p.minute < 30) ? "AM" : "PM";
   }
   if (market === "US") {
@@ -9342,7 +11052,7 @@ function getOrderSlotForMarket(market, now) {
 function jpSlotScheduledIso(dateKey, slot) {
   if (!dateKey) return "";
   const s = String(slot || "").toUpperCase();
-  const time = s === "AM" ? "09:30:00" : s === "PM" ? "15:33:00" : "";
+  const time = s === "AM" ? "09:30:00" : s === "PM" ? "16:00:00" : "";
   if (!time) return "";
   return `${dateKey}T${time}+09:00`;
 }
@@ -9395,7 +11105,8 @@ function isMarketClosedNow(market, now = new Date()) {
     const p = getTimePartsByZone(nowObj, "Asia/Tokyo");
     const nowMin = p.hour * 60 + p.minute;
     const openMin = 9 * 60;
-    const closeMin = 15 * 60;
+    // 東証の連続取引は 15:00 終了だが、本ゲームの JP PM 約定は 16:00。pending / catch-up と hasOrderSlotPassed を揃えるため 16:00 まで「市場内」扱い。
+    const closeMin = 16 * 60;
     return nowMin < openMin || nowMin > closeMin;
   }
   if (market === "US") {
@@ -9428,7 +11139,7 @@ function hasOrderSlotPassed(orderDate, orderSlot, market, now = new Date()) {
     if (orderDate === todayKey) {
       const nowMin = p.hour * 60 + p.minute;
       if (nowMin < 9 * 60 + 30) return false;
-      if (nowMin >= 9 * 60 + 30 && nowMin < 15 * 60 + 33 && orderSlot === "PM") return false;
+      if (nowMin >= 9 * 60 + 30 && nowMin < 16 * 60 && orderSlot === "PM") return false;
     }
   } else if (market === "US") {
     zone = "America/New_York";
@@ -9447,7 +11158,7 @@ function hasOrderSlotPassed(orderDate, orderSlot, market, now = new Date()) {
   if (!orderSlot) return orderDate < todayKey;
   let slotMinutes;
   if (market === "JP") {
-    slotMinutes = orderSlot === "AM" ? 9 * 60 + 30 : 15 * 60 + 33;
+    slotMinutes = orderSlot === "AM" ? 9 * 60 + 30 : 16 * 60;
   } else if (market === "US") {
     slotMinutes = orderSlot === "AM" ? 10 * 60 : 16 * 60;
   } else {

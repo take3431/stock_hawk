@@ -1022,6 +1022,23 @@ small {
   align-self: flex-start;
 }
 
+.rank-refresh-row {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.35rem 0.55rem;
+}
+
+.rank-refresh-progress {
+  margin: 0;
+  font-size: clamp(0.62rem, 0.35vw + 0.58rem, 0.72rem);
+  line-height: 1.2;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+  min-height: 1em;
+}
+
 .rank-refresh-toolbar .rank-last-update-label {
   margin: 0;
   font-size: clamp(0.78rem, 0.45vw + 0.7rem, 0.88rem);

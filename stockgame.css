@@ -126,11 +126,32 @@ input[type="password"]::-ms-clear {
   overflow-wrap: break-word;
 }
 
-.register-trial-notice {
-  margin: 0 0 8px;
+.auth-password-hint {
+  display: block;
+  margin-top: 0.35rem;
   font-size: 0.85rem;
   line-height: 1.5;
   color: var(--muted);
+}
+
+/* 再設定回答まわりの説明文（フォントサイズを揃える） */
+#authForm #authRecoveryField small.auth-recovery-help,
+#resetForm small.auth-recovery-help {
+  display: block;
+  margin-top: 0.35rem;
+  font-size: 0.85rem;
+  line-height: 1.5;
+  font-weight: 400;
+  color: var(--muted);
+}
+
+.auth-field-password-confirm {
+  margin-bottom: 2.25rem;
+}
+
+/* 新規登録: パスワード（確認）と再設定質問ブロックのあいだをさらに確保（マージンとパディングは相殺されにくい） */
+#authForm #authRecoveryField {
+  padding-top: 0.85rem;
 }
 
 .intro-dialog {
@@ -569,6 +590,17 @@ label {
   color: #254949;
 }
 
+.field-label-note {
+  font-weight: 400;
+  color: var(--muted);
+}
+
+/* 今月ランキング: ログイン中ユーザーの自分の行の表示名のみ太字（色は他行と同じ） */
+.rank-account-self-name {
+  color: inherit;
+  font-weight: 700;
+}
+
 input,
 select,
 button {
@@ -750,7 +782,7 @@ small {
   overflow-wrap: break-word;
 }
 
-/* 銘柄選択：約定の説明（幅を取りすぎない・短文） */
+/* 銘柄選択：約定の説明（日本株=JST、米国株・仮想通貨=NY・同一スケジュール） */
 #pickPanel .pick-timing-note {
   margin: 4px 0 10px;
   padding: 0;

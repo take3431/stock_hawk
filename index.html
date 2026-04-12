@@ -108,7 +108,7 @@
             "name": "約定はいつですか？",
             "acceptedAnswer": {
               "@type": "Answer",
-              "text": "日本株・米国株は1日2回（寄りの約30分後と終値）、仮想通貨は日本時間0:00と12:00を目安にゲーム内で約定します。"
+              "text": "日本株は1日2回（寄りの約30分後と終値・日本時間）。米国株と仮想通貨は同じスケジュールで、ニューヨーク時間の寄り付き後と終値を目安に各1日2回ゲーム内で約定します。"
             }
           }
         ]
@@ -124,7 +124,7 @@
     href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700&family=Zen+Kaku+Gothic+New:wght@400;500;700&display=swap"
     rel="stylesheet"
   />
-  <link rel="stylesheet" href="./stockgame.css?v=109" />
+  <link rel="stylesheet" href="./stockgame.css?v=120" />
 </head>
 <body>
   <noscript>
@@ -172,7 +172,7 @@
         <div class="intro-body">
           <p><strong>このアプリでできること</strong><br>毎月の運用で、保有銘柄の上昇率（%）を参加者同士で競うゲームです。ランキング1位を目指してがんばりましょう！</p>
           <p><strong>保有できる銘柄数</strong><br>銘柄の追加画面で、<strong>最低1銘柄</strong>・<strong>最大5銘柄</strong>まで保有できます。</p>
-          <p><strong>注文と約定</strong><br>買い注文・売り注文は、売買できる期間内であればいつでも入力できます。<br class="rule-br-mobile" />約定のタイミングは市場ごとに決まっています。<br />日本株・米国株は<strong>1日2回</strong>（寄りの約30分後と終値）、仮想通貨は<strong>日本時間 0:00／12:00</strong>に約定します。</p>
+          <p><strong>注文と約定</strong><br>買い注文・売り注文は、売買できる期間内であればいつでも入力できます。<br class="rule-br-mobile" />約定のタイミングは市場ごとに決まっています。<br />日本株は<strong>1日2回</strong>（寄りの約30分後と終値・日本時間）。米国株・仮想通貨は<strong>同じく1日2回</strong>（ニューヨーク時間の寄り付き後と終値）に約定します。</p>
           <p><strong>対象月</strong><br>毎月1日0:00（日本時間）から月末まで。その月の結果は月が変わると確定し、履歴に残ります。</p>
         </div>
         <button type="button" class="btn btn-primary intro-close-btn">理解しました</button>
@@ -205,8 +205,8 @@
               <li><strong>注文入力</strong>: 売買できる期間内で、<br class="rule-br-mobile" />買い注文・売り注文をいつでも入力できます</li>
               <li><strong>約定タイミング</strong>:
                 <ul class="rule-timing-sub">
-                  <li>日本株・米国株: <strong>1日2回</strong>（始値の約30分後／終値）</li>
-                  <li>仮想通貨: <strong>日本時間 0:00／12:00</strong></li>
+                  <li>日本株: <strong>1日2回</strong>（始値の約30分後／終値・日本時間）</li>
+                  <li>米国株・仮想通貨: <strong>1日2回</strong>（始値の約30分後／終値・ニューヨーク時間／同一スケジュール）</li>
                 </ul>
               </li>
               <li><strong>結果の確定</strong>: 月が変わるとその月の結果が確定し、ランキングと履歴に残ります</li>
@@ -267,19 +267,20 @@
           <h2 id="authCardTitle">ログイン</h2>
           <form id="authForm" autocomplete="on">
             <div class="field">
-              <label for="authName">アカウント名（ID）</label>
+              <label for="authName"><span class="field-label-title">アカウント名（ID）</span><span id="authNameLabelNote" class="field-label-note hidden">　※本名はやめてください</span></label>
               <input id="authName" name="username" type="text" maxlength="8" placeholder="例: たろう / trader01" required />
               <small id="authNameHintRegister" class="hidden">日本語可。2〜8文字、日本語/英数字/記号を使用できます。</small>
             </div>
             <div class="field auth-field-password">
-              <label for="authPassword">パスワード</label>
+              <label for="authPassword"><span class="field-label-title">パスワード</span><span id="authPasswordLabelNote" class="field-label-note hidden">　※大切なパスワードを使用しないでください（流出の責任は取りません）</span></label>
               <div class="input-with-toggle">
               <input id="authPassword" name="password" type="password" maxlength="30" placeholder="英字・数字・記号/ 4文字以上" required autocomplete="new-password" />
                 <button type="button" class="password-toggle-btn password-toggle-eye" id="authPasswordToggle" aria-label="押している間だけパスワードを表示" title="押している間だけ表示"><svg class="eye-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
               </div>
-              <small>4〜30文字（英字・数字・記号、空白なし）</small>
+              <small id="authPasswordHintLogin" class="auth-password-hint">4〜30文字（英字・数字・記号、空白なし）</small>
+              <small id="authPasswordHintRegister" class="auth-password-hint hidden" role="note">4〜30文字（英字・数字・記号、空白なし）※簡単なパスワードで大丈夫です。</small>
             </div>
-            <div class="field hidden" id="passwordConfirmField">
+            <div class="field auth-field-password-confirm hidden" id="passwordConfirmField">
               <label for="authPasswordConfirm">パスワード（確認）</label>
               <div class="input-with-toggle">
                 <input id="authPasswordConfirm" name="password_confirm" type="password" maxlength="30" placeholder="もう一度入力" />
@@ -297,12 +298,10 @@
               </select>
               <label for="authRecoveryAnswer" style="margin-top: 0.5rem;">回答</label>
               <input id="authRecoveryAnswer" name="recovery_answer" type="text" maxlength="50" placeholder="回答を入力（2文字以上）" autocomplete="off" />
-              <small id="authRecoveryAnswerHint">英字・記号・数字・日本語</small>
-              <small>パスワードを忘れたときに使います。内容は保存時のみ暗号化され、第三者には見えません。</small>
+              <small id="authRecoveryAnswerHint" class="auth-recovery-help">英字・記号・数字・日本語。ひらがなとカタカナは同じとして扱います。</small>
+              <small class="auth-recovery-help">パスワードを忘れたときに使います。内容は保存時のみ暗号化され、第三者には見えません。</small>
+              <small class="auth-recovery-help">※大切なパスワードは使用しないでください。プライバシーポリシーはありません。自己責任でお願いします。</small>
             </div>
-            <p id="registerTrialNotice" class="register-trial-notice hidden" role="note">
-              ※大切なパスワードは使用しないでください。
-            </p>
             <p id="registerCountInfo" class="section-note hidden">登録可能数: <strong id="accountCountLabel">0 / 100</strong></p>
             <div class="auth-form-button-stack">
               <div class="auth-form-submit-row">
@@ -327,8 +326,8 @@
             </select>
             <label for="resetRecoveryAnswer">回答</label>
             <input id="resetRecoveryAnswer" type="text" maxlength="50" placeholder="回答を入力（2文字以上）" autocomplete="off" />
-            <small id="resetRecoveryAnswerHint">ひらがなとカタカナは同じとして扱います。</small>
-            <label for="resetNewPassword">新しいパスワード</label>
+            <small id="resetRecoveryAnswerHint" class="auth-recovery-help">英字・記号・数字・日本語。ひらがなとカタカナは同じとして扱います。</small>
+            <label for="resetNewPassword"><span class="field-label-title">新しいパスワード</span><span class="field-label-note">　※大切なパスワードを使用しないでください（流出の責任は取りません）</span></label>
             <div class="input-with-toggle">
               <input id="resetNewPassword" type="password" maxlength="30" placeholder="英字・数字・記号/ 4文字以上" />
               <button type="button" class="password-toggle-btn password-toggle-eye" id="resetNewPasswordToggle" aria-label="押している間だけ表示" title="押している間だけ表示"><svg class="eye-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
@@ -382,7 +381,7 @@
           </div>
           <div id="renameFormBlock" class="account-form-block hidden">
             <form id="renameForm" class="stack-form">
-              <label for="renameInput">アカウント名（ID）変更</label>
+              <label for="renameInput"><span class="field-label-title">アカウント名（ID）変更</span><span class="field-label-note">　※本名はやめてください</span></label>
               <input id="renameInput" type="text" maxlength="8" placeholder="新しいアカウント名" />
               <button type="submit" class="btn btn-strong">名前を更新</button>
             </form>
@@ -394,7 +393,7 @@
                 <input id="currentPasswordInput" type="password" maxlength="30" placeholder="現在のパスワード" />
                 <button type="button" class="password-toggle-btn password-toggle-eye" id="currentPasswordToggle" aria-label="押している間だけ表示" title="押している間だけ表示"><svg class="eye-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
               </div>
-              <label for="nextPasswordInput">新しいパスワード</label>
+              <label for="nextPasswordInput"><span class="field-label-title">新しいパスワード</span><span class="field-label-note">　※大切なパスワードを使用しないでください（流出の責任は取りません）</span></label>
               <div class="input-with-toggle">
                 <input id="nextPasswordInput" type="password" maxlength="30" placeholder="英字・数字・記号（()など）/ 4文字以上" />
                 <button type="button" class="password-toggle-btn password-toggle-eye" id="nextPasswordToggle" aria-label="押している間だけ表示" title="押している間だけ表示"><svg class="eye-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button>
@@ -478,7 +477,7 @@
             <div id="apiDiagMessage" class="api-diag hidden"></div>
             <div class="pick-timing-note pick-timing-note--below-diag" role="note">
               <span class="pick-timing-note__hdr">約定</span>
-              <span class="pick-timing-note__txt">日本・米国株は「寄りの約30分後」と「終値」。仮想通貨は日本時間の0:00と12:00</span>
+              <span class="pick-timing-note__txt">日本株は「寄りの約30分後」と「終値」（日本時間）。米国株・仮想通貨はニューヨーク時間で同じく「寄りの約30分後」と「終値」</span>
             </div>
           </div>
           <p id="pickUnconfirmedNotice" class="section-note pick-unconfirmed-notice hidden" aria-live="polite">※未確定のまま他画面へ移動すると変更は破棄されます。</p>
@@ -568,8 +567,8 @@
             <li><strong>注文入力</strong>: 売買できる期間内で、<br class="rule-br-mobile" />買い注文・売り注文をいつでも入力できます</li>
             <li><strong>約定タイミング</strong>:
               <ul class="rule-timing-sub">
-                <li>日本株・米国株: <strong>1日2回</strong>（始値の約30分後／終値）</li>
-                <li>仮想通貨: <strong>日本時間 0:00／12:00</strong></li>
+                <li>日本株: <strong>1日2回</strong>（始値の約30分後／終値・日本時間）</li>
+                <li>米国株・仮想通貨: <strong>1日2回</strong>（始値の約30分後／終値・ニューヨーク時間／同一スケジュール）</li>
               </ul>
             </li>
             <li><strong>結果の確定</strong>: 月が変わるとその月の結果が確定し、ランキングと履歴に残ります</li>
@@ -612,6 +611,6 @@
     };
   </script>
   <script src="./jp_company_autocomplete_engine.js"></script>
-  <script src="./stockgame.js?v=115" defer></script>
+  <script src="./stockgame.js?v=128" defer></script>
 </body>
 </html>
